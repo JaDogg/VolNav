@@ -102,6 +102,8 @@ struct TabKeyStroke {
 var eventTap: CFMachPort?
 var runLoopSource: CFRunLoopSource?
 var shortcutsEnabled = true
+var cycleAllApplications = true
+let kPrefCycleAllApplications = "CycleAllApplicationsEnabled"
 
 // MARK: - AX Helpers
 
@@ -144,59 +146,110 @@ func isCycleable(_ window: AXUIElement) -> Bool {
 // MARK: - Window Cycling
 
 func cycleWindows(forward: Bool) {
-    guard let frontApp = NSWorkspace.shared.frontmostApplication else { return }
-    let pid = frontApp.processIdentifier
-    let appRef = AXUIElementCreateApplication(pid)
+    if cycleAllApplications {
+        // Cycle across windows of all applications (system-wide).
+        let systemWide = AXUIElementCreateSystemWide()
 
-    var windowsRef: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-          let allWindows = windowsRef as? [AXUIElement]
-    else { return }
+        var allWindowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(systemWide, kAXWindowsAttribute as CFString, &allWindowsRef) == .success,
+              let allWindows = allWindowsRef as? [AXUIElement]
+        else { return }
 
-    var windows = allWindows.filter { isCycleable($0) }
-    if windows.count <= 1 {
-        var childrenRef: CFTypeRef?
-        if AXUIElementCopyAttributeValue(appRef, kAXChildrenAttribute as CFString, &childrenRef) == .success,
-           let children = childrenRef as? [AXUIElement] {
-            let candidateWindows = children.filter {
-                axStringAttribute($0, kAXRoleAttribute as String) == (kAXWindowRole as String)
-            }
-            let filtered = candidateWindows.filter { isCycleable($0) }
-            if filtered.count > 1 {
-                windows = filtered
+        let windows = allWindows.filter { isCycleable($0) }
+        guard windows.count > 1 else { return }
+
+        // Determine the currently focused window to compute the starting index.
+        var focusedAppRef: CFTypeRef?
+        var focusedWindowRef: CFTypeRef?
+        var currentIndex = 0
+
+        if AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedAppRef) == .success,
+           let focusedAppAny = focusedAppRef,
+           CFGetTypeID(focusedAppAny) == AXUIElementGetTypeID() {
+            let focusedApp = unsafeBitCast(focusedAppAny, to: AXUIElement.self)
+            if AXUIElementCopyAttributeValue(focusedApp, kAXFocusedWindowAttribute as CFString, &focusedWindowRef) == .success,
+               let focusedWindowAny = focusedWindowRef,
+               CFGetTypeID(focusedWindowAny) == AXUIElementGetTypeID() {
+                let focusedWindow = unsafeBitCast(focusedWindowAny, to: AXUIElement.self)
+                currentIndex = windows.firstIndex(where: { CFEqual($0, focusedWindow) }) ?? 0
             }
         }
-    }
 
-    guard windows.count > 1 else { return }
+        let nextIndex = forward
+            ? (currentIndex + 1) % windows.count
+            : (currentIndex - 1 + windows.count) % windows.count
 
-    // Resolve the currently focused window, falling back to index 0 when focus
-    // is inside an attached sheet or otherwise unresolvable.
-    var focusedRef: CFTypeRef?
-    let hasFocused = AXUIElementCopyAttributeValue(
-        appRef, kAXFocusedWindowAttribute as CFString, &focusedRef
-    ) == .success
+        let target = windows[nextIndex]
 
-    let currentIndex: Int
-    if hasFocused, let focused = focusedRef {
-        // CFEqual is required — pointer equality on AXUIElement is not reliable.
-        currentIndex = windows.firstIndex(where: { CFEqual($0, focused) }) ?? 0
+        // Bring the owning app to the front, then focus the window.
+        var targetPid: pid_t = 0
+        AXUIElementGetPid(target, &targetPid)
+        if let runningApp = NSRunningApplication(processIdentifier: targetPid) {
+            runningApp.activate(options: [])
+        }
+
+        // Raise first so the window comes visually to front, then grant it focus.
+        AXUIElementPerformAction(target, kAXRaiseAction as CFString)
+
+        let targetApp = AXUIElementCreateApplication(targetPid)
+        AXUIElementSetAttributeValue(targetApp, kAXFocusedWindowAttribute as CFString, target)
+
+        // Fallback for Electron and other apps that ignore kAXFocusedWindowAttribute writes.
+        AXUIElementPerformAction(target, kAXPressAction as CFString)
     } else {
-        currentIndex = 0
+        // Cycle only within the frontmost application's windows.
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else { return }
+        let pid = frontApp.processIdentifier
+        let appRef = AXUIElementCreateApplication(pid)
+
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let allWindows = windowsRef as? [AXUIElement]
+        else { return }
+
+        var windows = allWindows.filter { isCycleable($0) }
+        if windows.count <= 1 {
+            var childrenRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appRef, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+               let children = childrenRef as? [AXUIElement] {
+                let candidateWindows = children.filter {
+                    axStringAttribute($0, kAXRoleAttribute as String) == (kAXWindowRole as String)
+                }
+                let filtered = candidateWindows.filter { isCycleable($0) }
+                if filtered.count > 1 {
+                    windows = filtered
+                }
+            }
+        }
+
+        guard windows.count > 1 else { return }
+
+        // Resolve the currently focused window, falling back to index 0 when focus is unresolvable.
+        var focusedRef: CFTypeRef?
+        let hasFocused = AXUIElementCopyAttributeValue(
+            appRef, kAXFocusedWindowAttribute as CFString, &focusedRef
+        ) == .success
+
+        let currentIndex: Int
+        if hasFocused, let focused = focusedRef {
+            currentIndex = windows.firstIndex(where: { CFEqual($0, focused) }) ?? 0
+        } else {
+            currentIndex = 0
+        }
+
+        let nextIndex = forward
+            ? (currentIndex + 1) % windows.count
+            : (currentIndex - 1 + windows.count) % windows.count
+
+        let target = windows[nextIndex]
+
+        // Raise first so the window comes visually to front, then grant it focus.
+        AXUIElementPerformAction(target, kAXRaiseAction as CFString)
+        AXUIElementSetAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, target)
+
+        // Fallback for Electron and other apps that ignore kAXFocusedWindowAttribute writes.
+        AXUIElementPerformAction(target, kAXPressAction as CFString)
     }
-
-    let nextIndex = forward
-        ? (currentIndex + 1) % windows.count
-        : (currentIndex - 1 + windows.count) % windows.count
-
-    let target = windows[nextIndex]
-
-    // Raise first so the window comes visually to front, then grant it focus.
-    AXUIElementPerformAction(target, kAXRaiseAction as CFString)
-    AXUIElementSetAttributeValue(appRef, kAXFocusedWindowAttribute as CFString, target)
-
-    // Fallback for Electron and other apps that ignore kAXFocusedWindowAttribute writes.
-    AXUIElementPerformAction(target, kAXPressAction as CFString)
 }
 
 // MARK: - Tab Cycling
@@ -300,6 +353,12 @@ func eventTapCallback(
     let forward = keyCode == NX_KEYTYPE_SOUND_UP
 
     let globalFlags = CGEventSource.flagsState(.hidSystemState)
+
+    // If Shift is held, let the system handle volume normally.
+    if globalFlags.contains(.maskShift) {
+        return Unmanaged.passRetained(event)
+    }
+
     if globalFlags.contains(.maskCommand) {
         // Perform AX operations on the main thread to avoid tap timeouts and AX threading issues.
         DispatchQueue.main.async {
@@ -325,9 +384,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     var statusItem: NSStatusItem!
     var toggleMenuItem: NSMenuItem!
+    var scopeMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         requestAccessibility()
+        // Load persisted preference (default remains true when unset)
+        if UserDefaults.standard.object(forKey: kPrefCycleAllApplications) != nil {
+            cycleAllApplications = UserDefaults.standard.bool(forKey: kPrefCycleAllApplications)
+        }
         setupMenuBar()
         setupEventTap()
     }
@@ -361,6 +425,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         toggleMenuItem.state = .on
         toggleMenuItem.target = self
         menu.addItem(toggleMenuItem)
+        
+        let scopeTitle = "Cycle Across All Apps"
+        scopeMenuItem = NSMenuItem(
+            title: scopeTitle,
+            action: #selector(toggleCycleScope),
+            keyEquivalent: ""
+        )
+        scopeMenuItem.state = cycleAllApplications ? .on : .off
+        scopeMenuItem.target = self
+        menu.addItem(scopeMenuItem)
 
         menu.addItem(.separator())
 
@@ -399,6 +473,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         shortcutsEnabled.toggle()
         sender.state = shortcutsEnabled ? .on : .off
         updateStatusIcon()
+    }
+    
+    @objc func toggleCycleScope(_ sender: NSMenuItem) {
+        cycleAllApplications.toggle()
+        sender.state = cycleAllApplications ? .on : .off
+        UserDefaults.standard.set(cycleAllApplications, forKey: kPrefCycleAllApplications)
     }
 
     @objc func quit() {
