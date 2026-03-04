@@ -105,53 +105,87 @@ var shortcutsEnabled = true
 var cycleAllApplications = true
 let kPrefCycleAllApplications = "CycleAllApplicationsEnabled"
 
-// MARK: - AX Helpers
+// MRU list of regular apps (most recent first)
+var appMRU: [pid_t] = []
 
-/// Returns the string value of an AX attribute on `element`, or nil on failure.
-func axStringAttribute(_ element: AXUIElement, _ attribute: String) -> String? {
-    var value: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
-          let str = value as? String
-    else { return nil }
-    return str
+// MARK: - App Switching (MRU)
+
+func seedMRU() {
+    let me = NSRunningApplication.current.processIdentifier
+    let regularApps = NSWorkspace.shared.runningApplications
+        .filter { $0.activationPolicy == .regular }
+    if let front = NSWorkspace.shared.frontmostApplication,
+       front.activationPolicy == .regular {
+        appMRU = [front.processIdentifier] + regularApps
+            .map { $0.processIdentifier }
+            .filter { $0 != front.processIdentifier }
+    } else {
+        appMRU = regularApps.map { $0.processIdentifier }
+    }
+    // Do not include this utility app in MRU.
+    appMRU.removeAll { $0 == me }
 }
 
-/// Returns true when `window` is a normal, focusable, non-minimized AXWindow.
-/// Excludes sheets, drawers, and dialogs that shouldn't be cycled into.
-func isCycleable(_ window: AXUIElement) -> Bool {
-    guard let role = axStringAttribute(window, kAXRoleAttribute as String),
-          role == kAXWindowRole as String
-    else { return false }
-
-    if let subrole = axStringAttribute(window, kAXSubroleAttribute as String) {
-        let excluded: Set<String> = [
-            "AXSheet",
-            "AXDrawer",
-            "AXDialog",
-            "AXFloatingWindow",
-            "AXSystemDialog",
-        ]
-        if excluded.contains(subrole) { return false }
+func nextAppPID(forward: Bool) -> pid_t? {
+    guard !appMRU.isEmpty else { return nil }
+    if let front = NSWorkspace.shared.frontmostApplication,
+       front.activationPolicy == .regular {
+        let currentPID = front.processIdentifier
+        if let idx = appMRU.firstIndex(of: currentPID) {
+            return forward
+                ? appMRU[(idx + 1) % appMRU.count]
+                : appMRU[(idx - 1 + appMRU.count) % appMRU.count]
+        }
     }
+    return appMRU.first
+}
 
-    var minimizedRef: CFTypeRef?
-    if AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimizedRef) == .success,
-       let minimized = minimizedRef as? Bool, minimized {
-        return false
+func activateApp(pid: pid_t) {
+    if let app = NSRunningApplication(processIdentifier: pid) {
+        app.activate(options: [])
     }
-
-    return true
 }
 
 // MARK: - Window Cycling
 
 func cycleWindows(forward: Bool) {
+    // Local helpers to avoid any scope resolution issues.
+    func axStringAttr(_ element: AXUIElement, _ attribute: String) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+              let str = value as? String else { return nil }
+        return str
+    }
+
+    func isCycleableWin(_ window: AXUIElement) -> Bool {
+        guard let role = axStringAttr(window, kAXRoleAttribute as String),
+              role == kAXWindowRole as String else { return false }
+
+        if let subrole = axStringAttr(window, kAXSubroleAttribute as String) {
+            let excluded: Set<String> = [
+                "AXSheet",
+                "AXDrawer",
+                "AXDialog",
+                "AXFloatingWindow",
+                "AXSystemDialog",
+            ]
+            if excluded.contains(subrole) { return false }
+        }
+
+        var minimizedRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimizedRef) == .success,
+           let minimized = minimizedRef as? Bool, minimized {
+            return false
+        }
+
+        return true
+    }
+
     if cycleAllApplications {
-        // Instead of cycling all windows, simulate the system app switcher:
-        // Cmd+Tab for forward, Cmd+Shift+Tab for backward.
-        let tabKeyCode: CGKeyCode = 48 // kVK_Tab
-        let flags: CGEventFlags = forward ? [.maskCommand] : [.maskCommand, .maskShift]
-        postKeyStroke(TabKeyStroke(keyCode: tabKeyCode, flags: flags))
+        // Switch apps using MRU list without posting Cmd+Tab.
+        if let pid = nextAppPID(forward: forward) {
+            activateApp(pid: pid)
+        }
         return
     } else {
         // Cycle only within the frontmost application's windows.
@@ -164,15 +198,15 @@ func cycleWindows(forward: Bool) {
               let allWindows = windowsRef as? [AXUIElement]
         else { return }
 
-        var windows = allWindows.filter { isCycleable($0) }
+        var windows = allWindows.filter { isCycleableWin($0) }
         if windows.count <= 1 {
             var childrenRef: CFTypeRef?
             if AXUIElementCopyAttributeValue(appRef, kAXChildrenAttribute as CFString, &childrenRef) == .success,
                let children = childrenRef as? [AXUIElement] {
                 let candidateWindows = children.filter {
-                    axStringAttribute($0, kAXRoleAttribute as String) == (kAXWindowRole as String)
+                    axStringAttr($0, kAXRoleAttribute as String) == (kAXWindowRole as String)
                 }
-                let filtered = candidateWindows.filter { isCycleable($0) }
+                let filtered = candidateWindows.filter { isCycleableWin($0) }
                 if filtered.count > 1 {
                     windows = filtered
                 }
@@ -349,6 +383,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if UserDefaults.standard.object(forKey: kPrefCycleAllApplications) != nil {
             cycleAllApplications = UserDefaults.standard.bool(forKey: kPrefCycleAllApplications)
         }
+        // Track app activation to maintain an MRU list
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(appDidActivate(_:)),
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil
+        )
+        seedMRU()
         setupMenuBar()
         setupEventTap()
     }
@@ -430,6 +472,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         shortcutsEnabled.toggle()
         sender.state = shortcutsEnabled ? .on : .off
         updateStatusIcon()
+    }
+    
+    @objc func appDidActivate(_ note: Notification) {
+        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        let pid = app.processIdentifier
+        // Track only user-facing apps; include hidden or windowless as requested.
+        guard app.activationPolicy == .regular else { return }
+        appMRU.removeAll { $0 == pid }
+        appMRU.insert(pid, at: 0)
     }
     
     @objc func toggleCycleScope(_ sender: NSMenuItem) {
