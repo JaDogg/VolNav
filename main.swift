@@ -147,55 +147,12 @@ func isCycleable(_ window: AXUIElement) -> Bool {
 
 func cycleWindows(forward: Bool) {
     if cycleAllApplications {
-        // Cycle across windows of all applications (system-wide).
-        let systemWide = AXUIElementCreateSystemWide()
-
-        var allWindowsRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(systemWide, kAXWindowsAttribute as CFString, &allWindowsRef) == .success,
-              let allWindows = allWindowsRef as? [AXUIElement]
-        else { return }
-
-        let windows = allWindows.filter { isCycleable($0) }
-        guard windows.count > 1 else { return }
-
-        // Determine the currently focused window to compute the starting index.
-        var focusedAppRef: CFTypeRef?
-        var focusedWindowRef: CFTypeRef?
-        var currentIndex = 0
-
-        if AXUIElementCopyAttributeValue(systemWide, kAXFocusedApplicationAttribute as CFString, &focusedAppRef) == .success,
-           let focusedAppAny = focusedAppRef,
-           CFGetTypeID(focusedAppAny) == AXUIElementGetTypeID() {
-            let focusedApp = unsafeBitCast(focusedAppAny, to: AXUIElement.self)
-            if AXUIElementCopyAttributeValue(focusedApp, kAXFocusedWindowAttribute as CFString, &focusedWindowRef) == .success,
-               let focusedWindowAny = focusedWindowRef,
-               CFGetTypeID(focusedWindowAny) == AXUIElementGetTypeID() {
-                let focusedWindow = unsafeBitCast(focusedWindowAny, to: AXUIElement.self)
-                currentIndex = windows.firstIndex(where: { CFEqual($0, focusedWindow) }) ?? 0
-            }
-        }
-
-        let nextIndex = forward
-            ? (currentIndex + 1) % windows.count
-            : (currentIndex - 1 + windows.count) % windows.count
-
-        let target = windows[nextIndex]
-
-        // Bring the owning app to the front, then focus the window.
-        var targetPid: pid_t = 0
-        AXUIElementGetPid(target, &targetPid)
-        if let runningApp = NSRunningApplication(processIdentifier: targetPid) {
-            runningApp.activate(options: [])
-        }
-
-        // Raise first so the window comes visually to front, then grant it focus.
-        AXUIElementPerformAction(target, kAXRaiseAction as CFString)
-
-        let targetApp = AXUIElementCreateApplication(targetPid)
-        AXUIElementSetAttributeValue(targetApp, kAXFocusedWindowAttribute as CFString, target)
-
-        // Fallback for Electron and other apps that ignore kAXFocusedWindowAttribute writes.
-        AXUIElementPerformAction(target, kAXPressAction as CFString)
+        // Instead of cycling all windows, simulate the system app switcher:
+        // Cmd+Tab for forward, Cmd+Shift+Tab for backward.
+        let tabKeyCode: CGKeyCode = 48 // kVK_Tab
+        let flags: CGEventFlags = forward ? [.maskCommand] : [.maskCommand, .maskShift]
+        postKeyStroke(TabKeyStroke(keyCode: tabKeyCode, flags: flags))
+        return
     } else {
         // Cycle only within the frontmost application's windows.
         guard let frontApp = NSWorkspace.shared.frontmostApplication else { return }
