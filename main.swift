@@ -153,7 +153,21 @@ func cycleWindows(forward: Bool) {
           let allWindows = windowsRef as? [AXUIElement]
     else { return }
 
-    let windows = allWindows.filter { isCycleable($0) }
+    var windows = allWindows.filter { isCycleable($0) }
+    if windows.count <= 1 {
+        var childrenRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(appRef, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+           let children = childrenRef as? [AXUIElement] {
+            let candidateWindows = children.filter {
+                axStringAttribute($0, kAXRoleAttribute as String) == (kAXWindowRole as String)
+            }
+            let filtered = candidateWindows.filter { isCycleable($0) }
+            if filtered.count > 1 {
+                windows = filtered
+            }
+        }
+    }
+
     guard windows.count > 1 else { return }
 
     // Resolve the currently focused window, falling back to index 0 when focus
@@ -285,8 +299,12 @@ func eventTapCallback(
 
     let forward = keyCode == NX_KEYTYPE_SOUND_UP
 
-    if event.flags.contains(.maskCommand) {
-        cycleWindows(forward: forward)
+    let globalFlags = CGEventSource.flagsState(.hidSystemState)
+    if globalFlags.contains(.maskCommand) {
+        // Perform AX operations on the main thread to avoid tap timeouts and AX threading issues.
+        DispatchQueue.main.async {
+            cycleWindows(forward: forward)
+        }
     } else {
         guard let app = NSWorkspace.shared.frontmostApplication,
               let bundleID = app.bundleIdentifier,
