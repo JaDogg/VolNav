@@ -85,6 +85,7 @@ let supportedApps: Set<String> = Set(appRegistry.keys)
 
 let NX_KEYTYPE_SOUND_UP:   Int64 = 0
 let NX_KEYTYPE_SOUND_DOWN: Int64 = 1
+let NX_KEYTYPE_MUTE:       Int64 = 7
 
 /// Sentinel stamped on synthetic key events so our tap never re-intercepts them.
 let kSyntheticEventMarker: Int64 = 0xDEADBEEF
@@ -264,6 +265,31 @@ func tabKeystrokeForApp(bundleID: String, isVolumeUp: Bool) -> TabKeyStroke? {
     }
 }
 
+/// Returns the keystroke to open a new tab for the given bundle ID.
+/// Defaults to Command+T, with exceptions for VSCode-like apps that use Command+N.
+func newTabKeystrokeForApp(bundleID: String) -> TabKeyStroke? {
+    // VSCode family uses Command+N to create a new untitled tab/file.
+    let vscodeLike: Set<String> = [
+        "com.microsoft.VSCode",
+        "com.microsoft.VSCodeInsiders",
+        "com.vscodium.codium",
+        "com.todesktop.230313mzl4w4u92", // Cursor
+        "com.exafunction.windsurf"       // Windsurf
+    ]
+
+    if vscodeLike.contains(bundleID) {
+        return TabKeyStroke(
+            keyCode: 45,                    // N
+            flags: [.maskCommand]
+        )
+    } else {
+        return TabKeyStroke(
+            keyCode: 17,                    // T
+            flags: [.maskCommand]
+        )
+    }
+}
+
 func postKeyStroke(_ keystroke: TabKeyStroke) {
     guard let source = CGEventSource(stateID: .hidSystemState),
           let down = CGEvent(keyboardEventSource: source,
@@ -337,8 +363,18 @@ func eventTapCallback(
         return Unmanaged.passRetained(event)
     }
 
-    guard keyCode == NX_KEYTYPE_SOUND_UP || keyCode == NX_KEYTYPE_SOUND_DOWN else {
+    guard keyCode == NX_KEYTYPE_SOUND_UP || keyCode == NX_KEYTYPE_SOUND_DOWN || keyCode == NX_KEYTYPE_MUTE else {
         return Unmanaged.passRetained(event)
+    }
+    
+    if (keyCode == NX_KEYTYPE_MUTE) {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              let bundleID = app.bundleIdentifier,
+              supportedApps.contains(bundleID),
+              let newTabKeyStroke = newTabKeystrokeForApp(bundleID: bundleID)
+        else { return nil }
+        postKeyStroke(newTabKeyStroke)
+        return nil
     }
 
     let forward = keyCode == NX_KEYTYPE_SOUND_UP
