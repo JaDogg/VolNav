@@ -65,6 +65,7 @@ let appRegistry: [String: TabShortcut] = [
     "com.sublimetext.4":                    .shiftBracket,
     "com.sublimetext.3":                    .shiftBracket,
     "com.panic.Nova":                       .shiftBracket,
+    "md.obsidian":                          .shiftBracket,  // Obsidian
 
     // Editors — JetBrains IDEs
     "com.jetbrains.intellij":               .shiftBracket,  // IntelliJ IDEA Ultimate
