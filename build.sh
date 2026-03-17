@@ -51,4 +51,6 @@ EOF
 
 chmod +x "$MACOS_DIR/$APP_NAME"
 
+codesign --force --deep --sign - "$APP_DIR"
+
 echo "Built $APP_NAME.app in current directory."

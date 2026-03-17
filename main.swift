@@ -1,5 +1,6 @@
 import Cocoa
 import ApplicationServices
+import ServiceManagement
 
 // MARK: - App Registry
 //
@@ -90,6 +91,9 @@ let NX_KEYTYPE_MUTE:       Int64 = 7
 /// Sentinel stamped on synthetic key events so our tap never re-intercepts them.
 let kSyntheticEventMarker: Int64 = 0xDEADBEEF
 
+/// How long the app-switch HUD stays on screen.
+let kHUDDisplayDuration: TimeInterval = 1.5
+
 /// CGEventType rawValue 14 = NX system-defined (media keys, volume, etc.)
 let systemDefinedEventType = CGEventType(rawValue: 14)!
 
@@ -106,8 +110,69 @@ var shortcutsEnabled = true
 var cycleAllApplications = true
 let kPrefCycleAllApplications = "CycleAllApplicationsEnabled"
 
+var ignoredBundleIDs: Set<String> = []
+let kPrefIgnoredApps = "IgnoredApps"
+
 // MRU list of regular apps (most recent first)
 var appMRU: [pid_t] = []
+
+// MARK: - App Switch HUD
+
+class AppSwitchHUD {
+    static let shared = AppSwitchHUD()
+    private var panel: NSPanel!
+    private var label: NSTextField!
+    private var iconView: NSImageView!
+    private var hideTask: DispatchWorkItem?
+
+    init() {
+        panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 260, height: 80),
+            styleMask: [.hudWindow, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+
+        let contentView = panel.contentView!
+
+        iconView = NSImageView(frame: NSRect(x: 16, y: 16, width: 48, height: 48))
+        iconView.imageScaling = .scaleProportionallyDown
+        contentView.addSubview(iconView)
+
+        label = NSTextField(frame: NSRect(x: 74, y: 22, width: 170, height: 36))
+        label.isBezeled = false
+        label.drawsBackground = false
+        label.isEditable = false
+        label.isSelectable = false
+        label.font = NSFont.systemFont(ofSize: 15, weight: .medium)
+        label.textColor = .white
+        label.cell?.wraps = false
+        label.cell?.truncatesLastVisibleLine = true
+        contentView.addSubview(label)
+    }
+
+    func show(appName: String, icon: NSImage?) {
+        hideTask?.cancel()
+        label.stringValue = appName
+        iconView.image = icon
+        if let screen = NSScreen.main {
+            let sw = screen.frame.width
+            let sh = screen.frame.height
+            let pw = panel.frame.width
+            let ph = panel.frame.height
+            panel.setFrameOrigin(NSPoint(x: screen.frame.minX + (sw - pw) / 2,
+                                         y: screen.frame.minY + (sh - ph) / 2))
+        }
+        panel.orderFrontRegardless()
+        let task = DispatchWorkItem { [weak self] in self?.panel.orderOut(nil) }
+        hideTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + kHUDDisplayDuration, execute: task)
+    }
+}
 
 // MARK: - App Switching (MRU)
 
@@ -139,12 +204,6 @@ func nextAppPID(forward: Bool) -> pid_t? {
         }
     }
     return appMRU.first
-}
-
-func activateApp(pid: pid_t) {
-    if let app = NSRunningApplication(processIdentifier: pid) {
-        app.activate(options: [])
-    }
 }
 
 // MARK: - Window Cycling
@@ -184,8 +243,10 @@ func cycleWindows(forward: Bool) {
 
     if cycleAllApplications {
         // Switch apps using MRU list without posting Cmd+Tab.
-        if let pid = nextAppPID(forward: forward) {
-            activateApp(pid: pid)
+        if let pid = nextAppPID(forward: forward),
+           let app = NSRunningApplication(processIdentifier: pid) {
+            app.activate(options: [])
+            AppSwitchHUD.shared.show(appName: app.localizedName ?? "Unknown", icon: app.icon)
         }
         return
     } else {
@@ -366,20 +427,34 @@ func eventTapCallback(
     guard keyCode == NX_KEYTYPE_SOUND_UP || keyCode == NX_KEYTYPE_SOUND_DOWN || keyCode == NX_KEYTYPE_MUTE else {
         return Unmanaged.passRetained(event)
     }
-    
-    if (keyCode == NX_KEYTYPE_MUTE) {
-        guard let app = NSWorkspace.shared.frontmostApplication,
-              let bundleID = app.bundleIdentifier,
-              supportedApps.contains(bundleID),
-              let newTabKeyStroke = newTabKeystrokeForApp(bundleID: bundleID)
-        else { return nil }
-        postKeyStroke(newTabKeyStroke)
+
+    // Read modifier flags and frontmost app once — reused by all branches below.
+    let globalFlags = CGEventSource.flagsState(.hidSystemState)
+    let frontBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+
+    // Pass through events for apps that the user has chosen to ignore.
+    if !frontBundleID.isEmpty && ignoredBundleIDs.contains(frontBundleID) {
+        return Unmanaged.passRetained(event)
+    }
+
+    if keyCode == NX_KEYTYPE_MUTE {
+        // Shift+Mute → pass through to system (real mute).
+        if globalFlags.contains(.maskShift) {
+            return Unmanaged.passRetained(event)
+        }
+        guard !frontBundleID.isEmpty, supportedApps.contains(frontBundleID) else { return nil }
+
+        if globalFlags.contains(.maskAlternate) {
+            // Option+Mute → Close Tab (Cmd+W)
+            postKeyStroke(TabKeyStroke(keyCode: 13, flags: [.maskCommand]))
+        } else {
+            guard let newTabKeyStroke = newTabKeystrokeForApp(bundleID: frontBundleID) else { return nil }
+            postKeyStroke(newTabKeyStroke)
+        }
         return nil
     }
 
     let forward = keyCode == NX_KEYTYPE_SOUND_UP
-
-    let globalFlags = CGEventSource.flagsState(.hidSystemState)
 
     // If Shift is held, let the system handle volume normally.
     if globalFlags.contains(.maskShift) {
@@ -392,10 +467,9 @@ func eventTapCallback(
             cycleWindows(forward: forward)
         }
     } else {
-        guard let app = NSWorkspace.shared.frontmostApplication,
-              let bundleID = app.bundleIdentifier,
-              supportedApps.contains(bundleID),
-              let stroke = tabKeystrokeForApp(bundleID: bundleID, isVolumeUp: forward)
+        guard !frontBundleID.isEmpty,
+              supportedApps.contains(frontBundleID),
+              let stroke = tabKeystrokeForApp(bundleID: frontBundleID, isVolumeUp: forward)
         else { return nil }
 
         postKeyStroke(stroke)
@@ -412,12 +486,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var toggleMenuItem: NSMenuItem!
     var scopeMenuItem: NSMenuItem!
+    var launchAtLoginMenuItem: NSMenuItem!
+    var ignoreAppMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         requestAccessibility()
-        // Load persisted preference (default remains true when unset)
+        // Load persisted preferences
         if UserDefaults.standard.object(forKey: kPrefCycleAllApplications) != nil {
             cycleAllApplications = UserDefaults.standard.bool(forKey: kPrefCycleAllApplications)
+        }
+        if let saved = UserDefaults.standard.array(forKey: kPrefIgnoredApps) as? [String] {
+            ignoredBundleIDs = Set(saved)
         }
         // Track app activation to maintain an MRU list
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -443,14 +522,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateStatusIcon()
 
         let menu = NSMenu()
+        menu.delegate = self
 
-        let permissionItem = NSMenuItem(
-            title: "Check Accessibility Permission",
-            action: #selector(checkPermission),
-            keyEquivalent: ""
-        )
-        permissionItem.target = self
-        menu.addItem(permissionItem)
+        // ── Key Bindings section ──────────────────────────────────────────
+        menu.addItem(makeSectionHeader("Key Bindings"))
+        menu.addItem(makeBindingRow("Vol ↑↓", "Next / Prev Tab"))
+        menu.addItem(makeBindingRow("Mute", "New Tab"))
+        menu.addItem(makeBindingRow("Opt+Mute", "Close Tab"))
+        menu.addItem(makeBindingRow("Shift+Vol", "Real Volume"))
+        menu.addItem(makeBindingRow("Cmd+Vol", "Cycle Apps"))
+
+        menu.addItem(.separator())
+
+        // ── Options section ───────────────────────────────────────────────
+        menu.addItem(makeSectionHeader("Options"))
 
         toggleMenuItem = NSMenuItem(
             title: "Enable Shortcuts",
@@ -460,16 +545,54 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         toggleMenuItem.state = .on
         toggleMenuItem.target = self
         menu.addItem(toggleMenuItem)
-        
-        let scopeTitle = "Cycle Across All Apps"
+
+        launchAtLoginMenuItem = NSMenuItem(
+            title: "Launch at Login",
+            action: #selector(toggleLaunchAtLogin),
+            keyEquivalent: ""
+        )
+        launchAtLoginMenuItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        launchAtLoginMenuItem.target = self
+        menu.addItem(launchAtLoginMenuItem)
+
         scopeMenuItem = NSMenuItem(
-            title: scopeTitle,
+            title: "Cycle Across All Apps",
             action: #selector(toggleCycleScope),
             keyEquivalent: ""
         )
         scopeMenuItem.state = cycleAllApplications ? .on : .off
         scopeMenuItem.target = self
         menu.addItem(scopeMenuItem)
+
+        menu.addItem(.separator())
+
+        // ── Per-app ignore ────────────────────────────────────────────────
+        ignoreAppMenuItem = NSMenuItem(
+            title: "Ignore App",
+            action: #selector(toggleIgnoreApp),
+            keyEquivalent: ""
+        )
+        ignoreAppMenuItem.target = self
+        menu.addItem(ignoreAppMenuItem)
+
+        menu.addItem(.separator())
+
+        // ── Info & permissions ────────────────────────────────────────────
+        let countItem = NSMenuItem(
+            title: "Supported Apps: \(appRegistry.count)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        countItem.isEnabled = false
+        menu.addItem(countItem)
+
+        let permissionItem = NSMenuItem(
+            title: "Check Accessibility Permission",
+            action: #selector(checkPermission),
+            keyEquivalent: ""
+        )
+        permissionItem.target = self
+        menu.addItem(permissionItem)
 
         menu.addItem(.separator())
 
@@ -480,13 +603,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
+    // Returns a disabled bold section header menu item.
+    private func makeSectionHeader(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.boldSystemFont(ofSize: NSFont.smallSystemFontSize),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        item.attributedTitle = NSAttributedString(string: title, attributes: attrs)
+        item.isEnabled = false
+        return item
+    }
+
+    // Returns a disabled row showing a key binding description.
+    private func makeBindingRow(_ key: String, _ action: String) -> NSMenuItem {
+        let item = NSMenuItem(title: "  \(key)  →  \(action)", action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
+    }
+
     /// Updates the menu bar icon and opacity to reflect the current enabled state.
     func updateStatusIcon() {
-        let symbolName = shortcutsEnabled
-            ? "arrow.left.arrow.right"
-            : "arrow.left.arrow.right"          // same icon, dimmed below
         statusItem.button?.image = NSImage(
-            systemSymbolName: symbolName,
+            systemSymbolName: "arrow.left.arrow.right",
             accessibilityDescription: shortcutsEnabled ? "Tab Switcher (on)" : "Tab Switcher (off)"
         )
         statusItem.button?.alphaValue = shortcutsEnabled ? 1.0 : 0.4
@@ -509,7 +648,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         sender.state = shortcutsEnabled ? .on : .off
         updateStatusIcon()
     }
-    
+
+    @objc func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        let svc = SMAppService.mainApp
+        do {
+            if svc.status == .enabled {
+                try svc.unregister()
+                sender.state = .off
+            } else {
+                try svc.register()
+                sender.state = .on
+            }
+        } catch {
+            // Silent — most likely a permissions issue.
+        }
+    }
+
+    @objc func toggleCycleScope(_ sender: NSMenuItem) {
+        cycleAllApplications.toggle()
+        sender.state = cycleAllApplications ? .on : .off
+        UserDefaults.standard.set(cycleAllApplications, forKey: kPrefCycleAllApplications)
+    }
+
+    @objc func toggleIgnoreApp(_ sender: NSMenuItem) {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              let bundleID = app.bundleIdentifier else { return }
+        if ignoredBundleIDs.contains(bundleID) {
+            ignoredBundleIDs.remove(bundleID)
+        } else {
+            ignoredBundleIDs.insert(bundleID)
+        }
+        UserDefaults.standard.set(Array(ignoredBundleIDs), forKey: kPrefIgnoredApps)
+    }
+
     @objc func appDidActivate(_ note: Notification) {
         guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
         let pid = app.processIdentifier
@@ -517,12 +688,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard app.activationPolicy == .regular else { return }
         appMRU.removeAll { $0 == pid }
         appMRU.insert(pid, at: 0)
-    }
-    
-    @objc func toggleCycleScope(_ sender: NSMenuItem) {
-        cycleAllApplications.toggle()
-        sender.state = cycleAllApplications ? .on : .off
-        UserDefaults.standard.set(cycleAllApplications, forKey: kPrefCycleAllApplications)
     }
 
     @objc func quit() {
@@ -560,6 +725,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+    }
+}
+
+// MARK: - NSMenuDelegate
+
+extension AppDelegate: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        let app = NSWorkspace.shared.frontmostApplication
+        let appName = app?.localizedName ?? "App"
+        let bundleID = app?.bundleIdentifier ?? ""
+        let isIgnored = ignoredBundleIDs.contains(bundleID)
+        ignoreAppMenuItem.title = isIgnored
+            ? "Re-enable for \(appName)"
+            : "Ignore \(appName)"
+        // Disable the item if there's no meaningful target (no bundle ID).
+        ignoreAppMenuItem.isEnabled = !bundleID.isEmpty
     }
 }
 
