@@ -155,9 +155,9 @@ class AppSwitchHUD {
         contentView.addSubview(label)
     }
 
-    func show(appName: String, icon: NSImage?) {
+    func show(appName: String, icon: NSImage?, forward: Bool) {
         hideTask?.cancel()
-        label.stringValue = appName
+        label.stringValue = forward ? "\(appName) →" : "← \(appName)"
         iconView.image = icon
         if let screen = NSScreen.main {
             let sw = screen.frame.width
@@ -246,7 +246,7 @@ func cycleWindows(forward: Bool) {
         if let pid = nextAppPID(forward: forward),
            let app = NSRunningApplication(processIdentifier: pid) {
             app.activate(options: [])
-            AppSwitchHUD.shared.show(appName: app.localizedName ?? "Unknown", icon: app.icon)
+            AppSwitchHUD.shared.show(appName: app.localizedName ?? "Unknown", icon: app.icon, forward: forward)
         }
         return
     } else {
@@ -487,6 +487,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var toggleMenuItem: NSMenuItem!
     var scopeMenuItem: NSMenuItem!
     var launchAtLoginMenuItem: NSMenuItem!
+    var appStatusMenuItem: NSMenuItem!
     var ignoreAppMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -566,7 +567,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        // ── Per-app ignore ────────────────────────────────────────────────
+        // ── Current app context ───────────────────────────────────────────
+        appStatusMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        appStatusMenuItem.isEnabled = false
+        menu.addItem(appStatusMenuItem)
+
         ignoreAppMenuItem = NSMenuItem(
             title: "Ignore App",
             action: #selector(toggleIgnoreApp),
@@ -587,8 +592,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(countItem)
 
         let permissionItem = NSMenuItem(
-            title: "Check Accessibility Permission",
-            action: #selector(checkPermission),
+            title: "Open Accessibility Settings",
+            action: #selector(openAccessibilitySettings),
             keyEquivalent: ""
         )
         permissionItem.target = self
@@ -615,6 +620,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return item
     }
 
+    // Returns a human-readable shortcut label for the given bundle ID.
+    private func tabShortcutLabel(for bundleID: String) -> String {
+        switch appRegistry[bundleID] {
+        case .shiftBracket: return "⌘⇧] / ⌘⇧["
+        case .optionArrow:  return "⌘⌥→ / ⌘⌥←"
+        case nil:           return "not supported"
+        }
+    }
+
     // Returns a disabled row showing a key binding description.
     private func makeBindingRow(_ key: String, _ action: String) -> NSMenuItem {
         let item = NSMenuItem(title: "  \(key)  →  \(action)", action: nil, keyEquivalent: "")
@@ -622,25 +636,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return item
     }
 
-    /// Updates the menu bar icon and opacity to reflect the current enabled state.
+    /// Updates the menu bar icon, opacity, and tooltip to reflect the current enabled state.
     func updateStatusIcon() {
         statusItem.button?.image = NSImage(
             systemSymbolName: "arrow.left.arrow.right",
-            accessibilityDescription: shortcutsEnabled ? "Tab Switcher (on)" : "Tab Switcher (off)"
+            accessibilityDescription: shortcutsEnabled ? "VolNav (on)" : "VolNav (off)"
         )
         statusItem.button?.alphaValue = shortcutsEnabled ? 1.0 : 0.4
+        statusItem.button?.toolTip = shortcutsEnabled
+            ? "VolNav: volume keys → tab navigation"
+            : "VolNav: shortcuts disabled"
     }
 
-    @objc func checkPermission() {
-        let trusted = AXIsProcessTrusted()
-        let alert = NSAlert()
-        alert.messageText = trusted
-            ? "✅ Accessibility Granted"
-            : "❌ Accessibility Not Granted"
-        alert.informativeText = trusted
-            ? "The app can intercept volume keys and control windows."
-            : "Open System Settings → Privacy & Security → Accessibility and enable this app."
-        alert.runModal()
+    @objc func openAccessibilitySettings() {
+        NSWorkspace.shared.open(
+            URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        )
     }
 
     @objc func toggleShortcuts(_ sender: NSMenuItem) {
@@ -715,9 +726,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Most likely cause: accessibility permission not yet granted.
             DispatchQueue.main.async {
                 let alert = NSAlert()
-                alert.messageText = "Could Not Install Event Tap"
-                alert.informativeText = "Please grant Accessibility permission in System Settings → Privacy & Security → Accessibility, then relaunch."
-                alert.runModal()
+                alert.messageText = "Accessibility Permission Required"
+                alert.informativeText = "VolNav needs Accessibility access to intercept volume keys. Grant permission, then relaunch."
+                alert.addButton(withTitle: "Open Settings")
+                alert.addButton(withTitle: "Later")
+                if alert.runModal() == .alertFirstButtonReturn {
+                    NSWorkspace.shared.open(
+                        URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+                    )
+                }
             }
             return
         }
@@ -735,11 +752,18 @@ extension AppDelegate: NSMenuDelegate {
         let app = NSWorkspace.shared.frontmostApplication
         let appName = app?.localizedName ?? "App"
         let bundleID = app?.bundleIdentifier ?? ""
+
+        // Current app status row
+        let shortcutLabel = tabShortcutLabel(for: bundleID)
+        appStatusMenuItem.title = bundleID.isEmpty
+            ? "  No active app"
+            : "  \(appName)  ·  \(shortcutLabel)"
+
+        // Ignore / re-enable toggle
         let isIgnored = ignoredBundleIDs.contains(bundleID)
         ignoreAppMenuItem.title = isIgnored
             ? "Re-enable for \(appName)"
             : "Ignore \(appName)"
-        // Disable the item if there's no meaningful target (no bundle ID).
         ignoreAppMenuItem.isEnabled = !bundleID.isEmpty
     }
 }
