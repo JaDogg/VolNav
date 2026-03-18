@@ -130,18 +130,24 @@ let kPrefIgnoredApps = "IgnoredApps"
 // MRU list of regular apps (most recent first)
 var appMRU: [pid_t] = []
 
-// MARK: - App Switch HUD
+// MARK: - Cycle HUD
 
-class AppSwitchHUD {
-    static let shared = AppSwitchHUD()
+/// Displays the full app list (app cycling) or window list (window cycling)
+/// with the next target highlighted.
+class CycleHUD {
+    static let shared = CycleHUD()
     private var panel: NSPanel!
-    private var label: NSTextField!
-    private var iconView: NSImageView!
     private var hideTask: DispatchWorkItem?
+
+    private let kItemW: CGFloat = 80    // width of each app cell
+    private let kItemH: CGFloat = 76    // icon(48) + label(16) + padding
+    private let kPad:   CGFloat = 12    // panel edge padding
+    private let kRowH:  CGFloat = 30    // height of each window row
+    private let kListW: CGFloat = 420   // width of window list panel
 
     init() {
         panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 260, height: 80),
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 100),
             styleMask: [.hudWindow, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -150,38 +156,135 @@ class AppSwitchHUD {
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         panel.isOpaque = false
         panel.backgroundColor = .clear
-
-        let contentView = panel.contentView!
-
-        iconView = NSImageView(frame: NSRect(x: 16, y: 16, width: 48, height: 48))
-        iconView.imageScaling = .scaleProportionallyDown
-        contentView.addSubview(iconView)
-
-        label = NSTextField(frame: NSRect(x: 74, y: 22, width: 170, height: 36))
-        label.isBezeled = false
-        label.drawsBackground = false
-        label.isEditable = false
-        label.isSelectable = false
-        label.font = NSFont.systemFont(ofSize: 15, weight: .medium)
-        label.textColor = .white
-        label.cell?.wraps = false
-        label.cell?.truncatesLastVisibleLine = true
-        contentView.addSubview(label)
+        panel.hasShadow = true
     }
 
-    func show(appName: String, icon: NSImage?, forward: Bool) {
-        hideTask?.cancel()
-        label.stringValue = forward ? "\(appName) →" : "← \(appName)"
-        iconView.image = icon
+    /// Horizontal app grid. Pass the full unfiltered MRU list so excluded
+    /// apps are visible (dimmed) but not navigated to.
+    func showApps(pids: [pid_t], selectedPID: pid_t, excludedIDs: Set<String>) {
+        typealias Entry = (app: NSRunningApplication, excluded: Bool)
+        let entries: [Entry] = pids.compactMap {
+            guard let a = NSRunningApplication(processIdentifier: $0) else { return nil }
+            let excl = a.bundleIdentifier.map { excludedIDs.contains($0) } ?? false
+            return (a, excl)
+        }
+        guard !entries.isEmpty else { return }
+
+        let screenW  = NSScreen.main?.frame.width ?? 1440
+        let maxW     = screenW - 40
+        // Shrink items if needed, but not below 54 px
+        let itemW    = min(kItemW, max(54, floor((maxW - kPad * 2) / CGFloat(entries.count))))
+        let panelW   = min(itemW * CGFloat(entries.count) + kPad * 2, maxW)
+        let panelH   = kItemH + kPad * 2
+        let iconSize: CGFloat = min(48, itemW - 8)
+
+        let cv = NSView(frame: NSRect(x: 0, y: 0, width: panelW, height: panelH))
+
+        for (i, entry) in entries.enumerated() {
+            let x          = kPad + CGFloat(i) * itemW
+            let isSelected = entry.app.processIdentifier == selectedPID
+
+            if isSelected {
+                let bg = NSBox(frame: NSRect(x: x + 2, y: kPad + 2,
+                                            width: itemW - 4, height: kItemH - 4))
+                bg.boxType      = .custom
+                bg.cornerRadius = 8
+                bg.fillColor    = NSColor(white: 1.0, alpha: 0.25)
+                bg.borderColor  = .clear
+                cv.addSubview(bg)
+            }
+
+            let iconView = NSImageView(frame: NSRect(
+                x: x + (itemW - iconSize) / 2,
+                y: kPad + 20,
+                width: iconSize, height: iconSize
+            ))
+            iconView.image        = entry.app.icon
+            iconView.imageScaling = .scaleProportionallyDown
+            iconView.alphaValue   = entry.excluded ? 0.3 : 1.0
+            cv.addSubview(iconView)
+
+            let lbl = NSTextField(frame: NSRect(x: x + 2, y: kPad + 3,
+                                               width: itemW - 4, height: 15))
+            lbl.isBezeled = false; lbl.drawsBackground = false
+            lbl.isEditable = false; lbl.isSelectable = false
+            lbl.alignment  = .center
+            lbl.font       = NSFont.systemFont(ofSize: min(9, itemW / 8),
+                                               weight: isSelected ? .semibold : .regular)
+            lbl.textColor  = entry.excluded ? NSColor(white: 1, alpha: 0.35) : .white
+            lbl.stringValue = entry.app.localizedName ?? ""
+            lbl.cell?.truncatesLastVisibleLine = true
+            lbl.cell?.lineBreakMode = .byTruncatingTail
+            cv.addSubview(lbl)
+        }
+
+        present(view: cv, size: NSSize(width: panelW, height: panelH))
+    }
+
+    /// Vertical window list. All windows shown; selected row highlighted.
+    func showWindows(titles: [String], selectedIndex: Int) {
+        let screenH = NSScreen.main?.frame.height ?? 900
+        let rawH    = CGFloat(titles.count) * kRowH + kPad * 2
+        let panelH  = min(rawH, screenH * 0.6)
+        let panelW  = kListW
+
+        // If the list is taller than the panel, scroll so the selected row is centred.
+        let visibleRows = Int(floor((panelH - kPad * 2) / kRowH))
+        let scrollStart = max(0, min(selectedIndex - visibleRows / 2,
+                                     titles.count - visibleRows))
+
+        let cv = NSView(frame: NSRect(x: 0, y: 0, width: panelW, height: panelH))
+
+        for (i, title) in titles.enumerated() {
+            let visRow = i - scrollStart
+            guard visRow >= 0 && visRow < visibleRows else { continue }
+
+            let y          = panelH - kPad - CGFloat(visRow + 1) * kRowH
+            let isSelected = i == selectedIndex
+
+            if isSelected {
+                let bg = NSBox(frame: NSRect(x: kPad, y: y,
+                                            width: panelW - kPad * 2, height: kRowH - 2))
+                bg.boxType      = .custom
+                bg.cornerRadius = 6
+                bg.fillColor    = NSColor(white: 1.0, alpha: 0.25)
+                bg.borderColor  = .clear
+                cv.addSubview(bg)
+            }
+
+            let lbl = NSTextField(frame: NSRect(x: kPad + 8, y: y + 6,
+                                               width: panelW - kPad * 2 - 16, height: kRowH - 12))
+            lbl.isBezeled = false; lbl.drawsBackground = false
+            lbl.isEditable = false; lbl.isSelectable = false
+            lbl.font      = NSFont.systemFont(ofSize: 13,
+                                              weight: isSelected ? .semibold : .regular)
+            lbl.textColor = .white
+            lbl.stringValue = title.isEmpty ? "(Untitled)" : title
+            lbl.cell?.truncatesLastVisibleLine = true
+            lbl.cell?.lineBreakMode = .byTruncatingMiddle
+            cv.addSubview(lbl)
+        }
+
+        present(view: cv, size: NSSize(width: panelW, height: panelH))
+    }
+
+    private func present(view: NSView, size: NSSize) {
+        panel.contentView?.subviews.forEach { $0.removeFromSuperview() }
+        panel.setContentSize(size)
+        view.frame = NSRect(origin: .zero, size: size)
+        panel.contentView?.addSubview(view)
         if let screen = NSScreen.main {
-            let sw = screen.frame.width
-            let sh = screen.frame.height
-            let pw = panel.frame.width
-            let ph = panel.frame.height
-            panel.setFrameOrigin(NSPoint(x: screen.frame.minX + (sw - pw) / 2,
-                                         y: screen.frame.minY + (sh - ph) / 2))
+            panel.setFrameOrigin(NSPoint(
+                x: screen.frame.minX + (screen.frame.width  - size.width)  / 2,
+                y: screen.frame.minY + (screen.frame.height - size.height) / 2
+            ))
         }
         panel.orderFrontRegardless()
+        scheduleHide()
+    }
+
+    private func scheduleHide() {
+        hideTask?.cancel()
         let task = DispatchWorkItem { [weak self] in self?.panel.orderOut(nil) }
         hideTask = task
         DispatchQueue.main.asyncAfter(deadline: .now() + kHUDDisplayDuration, execute: task)
@@ -266,7 +369,9 @@ func cycleWindows(forward: Bool) {
         if let pid = nextAppPID(forward: forward),
            let app = NSRunningApplication(processIdentifier: pid) {
             app.activate(options: [])
-            AppSwitchHUD.shared.show(appName: app.localizedName ?? "Unknown", icon: app.icon, forward: forward)
+            // Show full unfiltered list so excluded apps are visible (dimmed).
+            CycleHUD.shared.showApps(pids: appMRU, selectedPID: pid,
+                                     excludedIDs: windowNavExcludedIDs)
         }
         return
     } else {
@@ -322,6 +427,10 @@ func cycleWindows(forward: Bool) {
 
         // Fallback for Electron and other apps that ignore kAXFocusedWindowAttribute writes.
         AXUIElementPerformAction(target, kAXPressAction as CFString)
+
+        // Show the full window list with the target highlighted.
+        let titles = windows.map { axStringAttr($0, kAXTitleAttribute as String) ?? "" }
+        CycleHUD.shared.showWindows(titles: titles, selectedIndex: nextIndex)
     }
 }
 
