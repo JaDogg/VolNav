@@ -51,8 +51,11 @@ cat > "$CONTENTS_DIR/Info.plist" <<EOF
 </plist>
 EOF
 
-# Build icon from SVG if icon.svg exists and iconutil/magick are available
-if [ -f "$BUILD_DIR/icon.svg" ] && command -v magick &>/dev/null && command -v iconutil &>/dev/null; then
+# Use pre-built icns if present, otherwise build from SVG
+if [ -f "$BUILD_DIR/AppIcon.icns" ]; then
+    cp "$BUILD_DIR/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+    echo "Icon copied from AppIcon.icns."
+elif [ -f "$BUILD_DIR/icon.svg" ] && command -v magick &>/dev/null && command -v iconutil &>/dev/null; then
     ICONSET_DIR="$BUILD_DIR/AppIcon.iconset"
     mkdir -p "$ICONSET_DIR"
     magick "$BUILD_DIR/icon.svg" -resize 16x16     "$ICONSET_DIR/icon_16x16.png"
@@ -67,7 +70,7 @@ if [ -f "$BUILD_DIR/icon.svg" ] && command -v magick &>/dev/null && command -v i
     magick "$BUILD_DIR/icon.svg" -resize 1024x1024 "$ICONSET_DIR/icon_512x512@2x.png"
     iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/AppIcon.icns"
     rm -rf "$ICONSET_DIR"
-    echo "Icon built and added to bundle."
+    echo "Icon built from SVG and added to bundle."
 fi
 
 chmod +x "$MACOS_DIR/$APP_NAME"
