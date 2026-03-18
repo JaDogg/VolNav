@@ -83,7 +83,20 @@ let appRegistry: [String: TabShortcut] = [
 ]
 
 /// Derived automatically — no need to maintain a separate list.
-let supportedApps: Set<String> = Set(appRegistry.keys)
+var supportedApps: Set<String> = Set(appRegistry.keys)
+
+/// User-added apps (persisted in UserDefaults). Merged with appRegistry at runtime.
+var userTabRegistry: [String: TabShortcut] = [:]
+let kPrefUserTabShiftBracket = "UserTabAppsShiftBracket"
+let kPrefUserTabOptionArrow  = "UserTabAppsOptionArrow"
+
+/// Apps excluded from Cmd+Vol app cycling (persisted in UserDefaults).
+var windowNavExcludedIDs: Set<String> = []
+let kPrefWindowNavExcluded = "WindowNavExcludedApps"
+
+func rebuildSupportedApps() {
+    supportedApps = Set(appRegistry.keys).union(userTabRegistry.keys)
+}
 
 let NX_KEYTYPE_SOUND_UP:   Int64 = 0
 let NX_KEYTYPE_SOUND_DOWN: Int64 = 1
@@ -194,17 +207,23 @@ func seedMRU() {
 }
 
 func nextAppPID(forward: Bool) -> pid_t? {
-    guard !appMRU.isEmpty else { return nil }
+    // Filter out excluded apps on the fly so the MRU list stays intact.
+    let mru = appMRU.filter { pid in
+        guard let app = NSRunningApplication(processIdentifier: pid),
+              let bid = app.bundleIdentifier else { return true }
+        return !windowNavExcludedIDs.contains(bid)
+    }
+    guard !mru.isEmpty else { return nil }
     if let front = NSWorkspace.shared.frontmostApplication,
        front.activationPolicy == .regular {
         let currentPID = front.processIdentifier
-        if let idx = appMRU.firstIndex(of: currentPID) {
+        if let idx = mru.firstIndex(of: currentPID) {
             return forward
-                ? appMRU[(idx + 1) % appMRU.count]
-                : appMRU[(idx - 1 + appMRU.count) % appMRU.count]
+                ? mru[(idx + 1) % mru.count]
+                : mru[(idx - 1 + mru.count) % mru.count]
         }
     }
-    return appMRU.first
+    return mru.first
 }
 
 // MARK: - Window Cycling
@@ -309,9 +328,9 @@ func cycleWindows(forward: Bool) {
 // MARK: - Tab Cycling
 
 /// Returns the keystroke to switch tabs for the given bundle ID,
-/// derived directly from appRegistry — no duplication.
+/// checking appRegistry first then userTabRegistry.
 func tabKeystrokeForApp(bundleID: String, isVolumeUp: Bool) -> TabKeyStroke? {
-    switch appRegistry[bundleID] {
+    switch appRegistry[bundleID] ?? userTabRegistry[bundleID] {
     case .shiftBracket:
         return TabKeyStroke(
             keyCode: isVolumeUp ? 30 : 33,      // ] = 30, [ = 33
@@ -490,6 +509,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var launchAtLoginMenuItem: NSMenuItem!
     var appStatusMenuItem: NSMenuItem!
     var ignoreAppMenuItem: NSMenuItem!
+    var addTabShiftMenuItem: NSMenuItem!
+    var addTabOptionMenuItem: NSMenuItem!
+    var removeTabMenuItem: NSMenuItem!
+    var windowNavExcludeMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         requestAccessibility()
@@ -499,6 +522,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let saved = UserDefaults.standard.array(forKey: kPrefIgnoredApps) as? [String] {
             ignoredBundleIDs = Set(saved)
+        }
+        if let shift = UserDefaults.standard.array(forKey: kPrefUserTabShiftBracket) as? [String] {
+            shift.forEach { userTabRegistry[$0] = .shiftBracket }
+        }
+        if let option = UserDefaults.standard.array(forKey: kPrefUserTabOptionArrow) as? [String] {
+            option.forEach { userTabRegistry[$0] = .optionArrow }
+        }
+        rebuildSupportedApps()
+        if let excl = UserDefaults.standard.array(forKey: kPrefWindowNavExcluded) as? [String] {
+            windowNavExcludedIDs = Set(excl)
         }
         // Track app activation to maintain an MRU list
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -581,6 +614,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ignoreAppMenuItem.target = self
         menu.addItem(ignoreAppMenuItem)
 
+        addTabShiftMenuItem = NSMenuItem(
+            title: "Add App as ⌘⇧] / ⌘⇧[ Tabs",
+            action: #selector(addAppAsShiftBracket),
+            keyEquivalent: ""
+        )
+        addTabShiftMenuItem.target = self
+        menu.addItem(addTabShiftMenuItem)
+
+        addTabOptionMenuItem = NSMenuItem(
+            title: "Add App as ⌘⌥→ / ⌘⌥← Tabs",
+            action: #selector(addAppAsOptionArrow),
+            keyEquivalent: ""
+        )
+        addTabOptionMenuItem.target = self
+        menu.addItem(addTabOptionMenuItem)
+
+        removeTabMenuItem = NSMenuItem(
+            title: "Remove App from Tab Navigation",
+            action: #selector(removeAppFromTabNav),
+            keyEquivalent: ""
+        )
+        removeTabMenuItem.target = self
+        menu.addItem(removeTabMenuItem)
+
+        windowNavExcludeMenuItem = NSMenuItem(
+            title: "Exclude App from App Cycling",
+            action: #selector(toggleWindowNavExclusion),
+            keyEquivalent: ""
+        )
+        windowNavExcludeMenuItem.target = self
+        menu.addItem(windowNavExcludeMenuItem)
+
         menu.addItem(.separator())
 
         // ── Info & permissions ────────────────────────────────────────────
@@ -623,7 +688,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Returns a human-readable shortcut label for the given bundle ID.
     private func tabShortcutLabel(for bundleID: String) -> String {
-        switch appRegistry[bundleID] {
+        switch appRegistry[bundleID] ?? userTabRegistry[bundleID] {
         case .shiftBracket: return "⌘⇧] / ⌘⇧["
         case .optionArrow:  return "⌘⌥→ / ⌘⌥←"
         case nil:           return "not supported"
@@ -702,6 +767,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         appMRU.insert(pid, at: 0)
     }
 
+    private func saveUserTabRegistry() {
+        let shift  = userTabRegistry.filter { $0.value == .shiftBracket }.map(\.key)
+        let option = userTabRegistry.filter { $0.value == .optionArrow  }.map(\.key)
+        UserDefaults.standard.set(shift,  forKey: kPrefUserTabShiftBracket)
+        UserDefaults.standard.set(option, forKey: kPrefUserTabOptionArrow)
+    }
+
+    @objc func addAppAsShiftBracket() {
+        guard let bid = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+              appRegistry[bid] == nil else { return }
+        userTabRegistry[bid] = .shiftBracket
+        rebuildSupportedApps()
+        saveUserTabRegistry()
+    }
+
+    @objc func addAppAsOptionArrow() {
+        guard let bid = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+              appRegistry[bid] == nil else { return }
+        userTabRegistry[bid] = .optionArrow
+        rebuildSupportedApps()
+        saveUserTabRegistry()
+    }
+
+    @objc func removeAppFromTabNav() {
+        guard let bid = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+              userTabRegistry[bid] != nil else { return }
+        userTabRegistry.removeValue(forKey: bid)
+        rebuildSupportedApps()
+        saveUserTabRegistry()
+    }
+
+    @objc func toggleWindowNavExclusion(_ sender: NSMenuItem) {
+        guard let bid = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return }
+        if windowNavExcludedIDs.contains(bid) {
+            windowNavExcludedIDs.remove(bid)
+        } else {
+            windowNavExcludedIDs.insert(bid)
+        }
+        UserDefaults.standard.set(Array(windowNavExcludedIDs), forKey: kPrefWindowNavExcluded)
+    }
+
     @objc func quit() {
         NSApplication.shared.terminate(nil)
     }
@@ -766,6 +872,23 @@ extension AppDelegate: NSMenuDelegate {
             ? "Re-enable for \(appName)"
             : "Ignore \(appName)"
         ignoreAppMenuItem.isEnabled = !bundleID.isEmpty
+
+        // Tab navigation add/remove items
+        let isBuiltIn    = !bundleID.isEmpty && appRegistry[bundleID] != nil
+        let isUserAdded  = !bundleID.isEmpty && userTabRegistry[bundleID] != nil
+        addTabShiftMenuItem.title   = "Add \(appName) as ⌘⇧] / ⌘⇧[ Tabs"
+        addTabOptionMenuItem.title  = "Add \(appName) as ⌘⌥→ / ⌘⌥← Tabs"
+        removeTabMenuItem.title     = "Remove \(appName) from Tab Navigation"
+        addTabShiftMenuItem.isHidden  = bundleID.isEmpty || isBuiltIn || isUserAdded
+        addTabOptionMenuItem.isHidden = bundleID.isEmpty || isBuiltIn || isUserAdded
+        removeTabMenuItem.isHidden    = !isUserAdded
+
+        // Window nav exclusion
+        let isExcluded = windowNavExcludedIDs.contains(bundleID)
+        windowNavExcludeMenuItem.title = isExcluded
+            ? "Include \(appName) in App Cycling"
+            : "Exclude \(appName) from App Cycling"
+        windowNavExcludeMenuItem.isEnabled = !bundleID.isEmpty
     }
 }
 
