@@ -124,6 +124,33 @@ var shortcutsEnabled = true
 var cycleAllApplications = true
 let kPrefCycleAllApplications = "CycleAllApplicationsEnabled"
 
+var cycleCurrentMonitorOnly = false
+let kPrefCycleCurrentMonitorOnly = "CycleCurrentMonitorOnly"
+
+/// Returns the screen that contains the current mouse pointer.
+func mouseScreen() -> NSScreen {
+    let pt = NSEvent.mouseLocation
+    return NSScreen.screens.first { NSMouseInRect(pt, $0.frame, false) } ?? NSScreen.main ?? NSScreen.screens[0]
+}
+
+/// Returns the screen that a given AX window's top-left origin falls on.
+func screenForWindow(_ window: AXUIElement) -> NSScreen? {
+    var posRef: CFTypeRef?
+    var sizeRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &posRef) == .success,
+          AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeRef) == .success,
+          let posVal = posRef, let sizeVal = sizeRef else { return nil }
+    var rawPos = CGPoint.zero
+    var rawSize = CGSize.zero
+    AXValueGetValue(posVal as! AXValue, .cgPoint, &rawPos)
+    AXValueGetValue(sizeVal as! AXValue, .cgSize, &rawSize)
+    // AX coordinates have origin at top-left of primary screen; flip to AppKit coords.
+    let primaryH = NSScreen.screens.first?.frame.height ?? 0
+    let winCenter = CGPoint(x: rawPos.x + rawSize.width / 2,
+                            y: primaryH - rawPos.y - rawSize.height / 2)
+    return NSScreen.screens.first { NSPointInRect(winCenter, $0.frame) }
+}
+
 var ignoredBundleIDs: Set<String> = []
 let kPrefIgnoredApps = "IgnoredApps"
 
@@ -170,7 +197,7 @@ class CycleHUD {
         }
         guard !entries.isEmpty else { return }
 
-        let screenW  = NSScreen.main?.frame.width ?? 1440
+        let screenW  = mouseScreen().frame.width
         let maxW     = screenW - 40
         // Shrink items if needed, but not below 54 px
         let itemW    = min(kItemW, max(54, floor((maxW - kPad * 2) / CGFloat(entries.count))))
@@ -223,7 +250,7 @@ class CycleHUD {
 
     /// Vertical window list. All windows shown; selected row highlighted.
     func showWindows(titles: [String], selectedIndex: Int) {
-        let screenH = NSScreen.main?.frame.height ?? 900
+        let screenH = mouseScreen().frame.height
         let rawH    = CGFloat(titles.count) * kRowH + kPad * 2
         let panelH  = min(rawH, screenH * 0.6)
         let panelW  = kListW
@@ -273,12 +300,11 @@ class CycleHUD {
         panel.setContentSize(size)
         view.frame = NSRect(origin: .zero, size: size)
         panel.contentView?.addSubview(view)
-        if let screen = NSScreen.main {
-            panel.setFrameOrigin(NSPoint(
-                x: screen.frame.minX + (screen.frame.width  - size.width)  / 2,
-                y: screen.frame.minY + (screen.frame.height - size.height) / 2
-            ))
-        }
+        let screen = mouseScreen()
+        panel.setFrameOrigin(NSPoint(
+            x: screen.frame.minX + (screen.frame.width  - size.width)  / 2,
+            y: screen.frame.minY + (screen.frame.height - size.height) / 2
+        ))
         panel.orderFrontRegardless()
         scheduleHide()
     }
@@ -309,12 +335,29 @@ func seedMRU() {
     appMRU.removeAll { $0 == me }
 }
 
+/// Returns true if the app has at least one visible (non-minimized) window on `screen`.
+func appHasWindowOnScreen(_ pid: pid_t, screen: NSScreen) -> Bool {
+    let appRef = AXUIElementCreateApplication(pid)
+    var windowsRef: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+          let windows = windowsRef as? [AXUIElement] else { return false }
+    return windows.contains { win in
+        var minRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute as CFString, &minRef) == .success,
+           let minimized = minRef as? Bool, minimized { return false }
+        return screenForWindow(win) == screen
+    }
+}
+
 func nextAppPID(forward: Bool) -> pid_t? {
+    let targetScreen = cycleCurrentMonitorOnly ? mouseScreen() : nil
     // Filter out excluded apps on the fly so the MRU list stays intact.
     let mru = appMRU.filter { pid in
         guard let app = NSRunningApplication(processIdentifier: pid),
               let bid = app.bundleIdentifier else { return true }
-        return !windowNavExcludedIDs.contains(bid)
+        if windowNavExcludedIDs.contains(bid) { return false }
+        if let screen = targetScreen { return appHasWindowOnScreen(pid, screen: screen) }
+        return true
     }
     guard !mru.isEmpty else { return nil }
     if let front = NSWorkspace.shared.frontmostApplication,
@@ -364,13 +407,22 @@ func cycleWindows(forward: Bool) {
         return true
     }
 
+    let targetScreen: NSScreen? = cycleCurrentMonitorOnly ? mouseScreen() : nil
+
     if cycleAllApplications {
         // Switch apps using MRU list without posting Cmd+Tab.
         if let pid = nextAppPID(forward: forward),
            let app = NSRunningApplication(processIdentifier: pid) {
             app.activate(options: [])
-            // Show full unfiltered list so excluded apps are visible (dimmed).
-            CycleHUD.shared.showApps(pids: appMRU, selectedPID: pid,
+            // When filtering by monitor, show only apps on that screen (excluded ones dimmed).
+            // Otherwise show the full unfiltered list so excluded apps are visible (dimmed).
+            let hudPIDs: [pid_t]
+            if let screen = targetScreen {
+                hudPIDs = appMRU.filter { appHasWindowOnScreen($0, screen: screen) }
+            } else {
+                hudPIDs = appMRU
+            }
+            CycleHUD.shared.showApps(pids: hudPIDs, selectedPID: pid,
                                      excludedIDs: windowNavExcludedIDs)
         }
         return
@@ -398,6 +450,11 @@ func cycleWindows(forward: Bool) {
                     windows = filtered
                 }
             }
+        }
+
+        // When filtering by monitor, only cycle windows on the mouse screen.
+        if let screen = targetScreen {
+            windows = windows.filter { screenForWindow($0) == screen }
         }
 
         guard windows.count > 1 else { return }
@@ -622,12 +679,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var addTabOptionMenuItem: NSMenuItem!
     var removeTabMenuItem: NSMenuItem!
     var windowNavExcludeMenuItem: NSMenuItem!
+    var currentMonitorMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         requestAccessibility()
         // Load persisted preferences
         if UserDefaults.standard.object(forKey: kPrefCycleAllApplications) != nil {
             cycleAllApplications = UserDefaults.standard.bool(forKey: kPrefCycleAllApplications)
+        }
+        if UserDefaults.standard.object(forKey: kPrefCycleCurrentMonitorOnly) != nil {
+            cycleCurrentMonitorOnly = UserDefaults.standard.bool(forKey: kPrefCycleCurrentMonitorOnly)
         }
         if let saved = UserDefaults.standard.array(forKey: kPrefIgnoredApps) as? [String] {
             ignoredBundleIDs = Set(saved)
@@ -707,6 +768,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         scopeMenuItem.state = cycleAllApplications ? .on : .off
         scopeMenuItem.target = self
         menu.addItem(scopeMenuItem)
+
+        currentMonitorMenuItem = NSMenuItem(
+            title: "Current Monitor Only",
+            action: #selector(toggleCurrentMonitor),
+            keyEquivalent: ""
+        )
+        currentMonitorMenuItem.state = cycleCurrentMonitorOnly ? .on : .off
+        currentMonitorMenuItem.target = self
+        menu.addItem(currentMonitorMenuItem)
 
         menu.addItem(.separator())
 
@@ -854,6 +924,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         cycleAllApplications.toggle()
         sender.state = cycleAllApplications ? .on : .off
         UserDefaults.standard.set(cycleAllApplications, forKey: kPrefCycleAllApplications)
+    }
+
+    @objc func toggleCurrentMonitor(_ sender: NSMenuItem) {
+        cycleCurrentMonitorOnly.toggle()
+        sender.state = cycleCurrentMonitorOnly ? .on : .off
+        UserDefaults.standard.set(cycleCurrentMonitorOnly, forKey: kPrefCycleCurrentMonitorOnly)
     }
 
     @objc func toggleIgnoreApp(_ sender: NSMenuItem) {
