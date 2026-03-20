@@ -127,6 +127,9 @@ let kPrefCycleAllApplications = "CycleAllApplicationsEnabled"
 var cycleCurrentMonitorOnly = false
 let kPrefCycleCurrentMonitorOnly = "CycleCurrentMonitorOnly"
 
+var cycleFlatAllWindows = false
+let kPrefCycleFlatAllWindows = "CycleFlatAllWindows"
+
 var shiftVolScrollMode = false
 let kPrefShiftVolScrollMode = "ShiftVolScrollMode"
 
@@ -377,39 +380,45 @@ func nextAppPID(forward: Bool) -> pid_t? {
 
 // MARK: - Window Cycling
 
+private func axStringAttr(_ element: AXUIElement, _ attribute: String) -> String? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+          let str = value as? String else { return nil }
+    return str
+}
+
+private func isCycleableWin(_ window: AXUIElement) -> Bool {
+    guard let role = axStringAttr(window, kAXRoleAttribute as String),
+          role == kAXWindowRole as String else { return false }
+
+    if let subrole = axStringAttr(window, kAXSubroleAttribute as String) {
+        let excluded: Set<String> = [
+            "AXSheet",
+            "AXDrawer",
+            "AXDialog",
+            "AXFloatingWindow",
+            "AXSystemDialog",
+        ]
+        if excluded.contains(subrole) { return false }
+    }
+
+    var minimizedRef: CFTypeRef?
+    if AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimizedRef) == .success,
+       let minimized = minimizedRef as? Bool, minimized {
+        return false
+    }
+
+    return true
+}
+
+private struct FlatWin {
+    let pid: pid_t
+    let appName: String
+    let element: AXUIElement
+    let title: String
+}
+
 func cycleWindows(forward: Bool) {
-    // Local helpers to avoid any scope resolution issues.
-    func axStringAttr(_ element: AXUIElement, _ attribute: String) -> String? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
-              let str = value as? String else { return nil }
-        return str
-    }
-
-    func isCycleableWin(_ window: AXUIElement) -> Bool {
-        guard let role = axStringAttr(window, kAXRoleAttribute as String),
-              role == kAXWindowRole as String else { return false }
-
-        if let subrole = axStringAttr(window, kAXSubroleAttribute as String) {
-            let excluded: Set<String> = [
-                "AXSheet",
-                "AXDrawer",
-                "AXDialog",
-                "AXFloatingWindow",
-                "AXSystemDialog",
-            ]
-            if excluded.contains(subrole) { return false }
-        }
-
-        var minimizedRef: CFTypeRef?
-        if AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimizedRef) == .success,
-           let minimized = minimizedRef as? Bool, minimized {
-            return false
-        }
-
-        return true
-    }
-
     let targetScreen: NSScreen? = cycleCurrentMonitorOnly ? mouseScreen() : nil
 
     if cycleAllApplications {
@@ -428,6 +437,9 @@ func cycleWindows(forward: Bool) {
             CycleHUD.shared.showApps(pids: hudPIDs, selectedPID: pid,
                                      excludedIDs: windowNavExcludedIDs)
         }
+        return
+    } else if cycleFlatAllWindows {
+        cycleWindowsFlat(forward: forward)
         return
     } else {
         // Cycle only within the frontmost application's windows.
@@ -492,6 +504,85 @@ func cycleWindows(forward: Bool) {
         let titles = windows.map { axStringAttr($0, kAXTitleAttribute as String) ?? "" }
         CycleHUD.shared.showWindows(titles: titles, selectedIndex: nextIndex)
     }
+}
+
+func cycleWindowsFlat(forward: Bool) {
+    let targetScreen: NSScreen? = cycleCurrentMonitorOnly ? mouseScreen() : nil
+
+    // Build ordered app list from MRU, filtering excluded apps.
+    let orderedPIDs: [pid_t] = appMRU.filter { pid in
+        guard let app = NSRunningApplication(processIdentifier: pid),
+              let bid = app.bundleIdentifier else { return true }
+        if windowNavExcludedIDs.contains(bid) { return false }
+        if let screen = targetScreen { return appHasWindowOnScreen(pid, screen: screen) }
+        return true
+    }
+
+    // Build flat window list across all apps.
+    var flatList: [FlatWin] = []
+    for pid in orderedPIDs {
+        guard let app = NSRunningApplication(processIdentifier: pid) else { continue }
+        let appName = app.localizedName ?? ""
+        let appRef = AXUIElementCreateApplication(pid)
+
+        var windowsRef: CFTypeRef?
+        var windows: [AXUIElement] = []
+        if AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+           let axWindows = windowsRef as? [AXUIElement] {
+            windows = axWindows.filter { isCycleableWin($0) }
+        }
+        // Fallback to kAXChildrenAttribute for apps that don't expose kAXWindowsAttribute.
+        if windows.isEmpty {
+            var childrenRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(appRef, kAXChildrenAttribute as CFString, &childrenRef) == .success,
+               let children = childrenRef as? [AXUIElement] {
+                let candidates = children.filter {
+                    axStringAttr($0, kAXRoleAttribute as String) == (kAXWindowRole as String)
+                }
+                windows = candidates.filter { isCycleableWin($0) }
+            }
+        }
+
+        if let screen = targetScreen {
+            windows = windows.filter { screenForWindow($0) == screen }
+        }
+
+        for win in windows {
+            let title = axStringAttr(win, kAXTitleAttribute as String) ?? ""
+            flatList.append(FlatWin(pid: pid, appName: appName, element: win, title: title))
+        }
+    }
+
+    guard !flatList.isEmpty else { return }
+
+    // Find current position: frontmost app + focused window.
+    var currentIndex = 0
+    if let frontApp = NSWorkspace.shared.frontmostApplication {
+        let frontPID = frontApp.processIdentifier
+        let frontAppRef = AXUIElementCreateApplication(frontPID)
+        var focusedRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(frontAppRef, kAXFocusedWindowAttribute as CFString, &focusedRef) == .success,
+           let focused = focusedRef {
+            currentIndex = flatList.firstIndex(where: { CFEqual($0.element, focused) }) ?? 0
+        }
+    }
+
+    let nextIndex = forward
+        ? (currentIndex + 1) % flatList.count
+        : (currentIndex - 1 + flatList.count) % flatList.count
+
+    let target = flatList[nextIndex]
+
+    // Activate target app and raise/focus the target window.
+    NSRunningApplication(processIdentifier: target.pid)?.activate(options: [])
+    let targetAppRef = AXUIElementCreateApplication(target.pid)
+    AXUIElementPerformAction(target.element, kAXRaiseAction as CFString)
+    AXUIElementSetAttributeValue(targetAppRef, kAXFocusedWindowAttribute as CFString, target.element)
+    AXUIElementPerformAction(target.element, kAXPressAction as CFString)  // Electron fallback
+
+    // Show HUD with "AppName – WindowTitle" format.
+    let hudTitles = flatList.map { "\($0.appName) – \($0.title.isEmpty ? "(Untitled)" : $0.title)" }
+    CycleHUD.shared.showWindows(titles: hudTitles, selectedIndex: nextIndex)
 }
 
 // MARK: - Tab Cycling
@@ -685,7 +776,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     var statusItem: NSStatusItem!
     var toggleMenuItem: NSMenuItem!
-    var scopeMenuItem: NSMenuItem!
+    var cycleModeAppsMenuItem: NSMenuItem!
+    var cycleModeFlatMenuItem: NSMenuItem!
+    var cycleModeCurrentMenuItem: NSMenuItem!
     var launchAtLoginMenuItem: NSMenuItem!
     var appStatusMenuItem: NSMenuItem!
     var ignoreAppMenuItem: NSMenuItem!
@@ -704,6 +797,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if UserDefaults.standard.object(forKey: kPrefCycleCurrentMonitorOnly) != nil {
             cycleCurrentMonitorOnly = UserDefaults.standard.bool(forKey: kPrefCycleCurrentMonitorOnly)
+        }
+        if UserDefaults.standard.object(forKey: kPrefCycleFlatAllWindows) != nil {
+            cycleFlatAllWindows = UserDefaults.standard.bool(forKey: kPrefCycleFlatAllWindows)
+            if cycleFlatAllWindows { cycleAllApplications = false }
         }
         if UserDefaults.standard.object(forKey: kPrefShiftVolScrollMode) != nil {
             shiftVolScrollMode = UserDefaults.standard.bool(forKey: kPrefShiftVolScrollMode)
@@ -754,7 +851,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(makeBindingRow("Opt+Mute", "Close Tab"))
         menu.addItem(makeBindingRow("Shift+Vol", "Real Volume / Page Up·Down"))
         menu.addItem(makeBindingRow("Shift+Mute", "Toggle Scroll Mode"))
-        menu.addItem(makeBindingRow("Cmd+Vol", "Cycle Apps"))
+        menu.addItem(makeBindingRow("Cmd+Vol", "Cycle Windows/Apps"))
 
         menu.addItem(.separator())
 
@@ -779,14 +876,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         launchAtLoginMenuItem.target = self
         menu.addItem(launchAtLoginMenuItem)
 
-        scopeMenuItem = NSMenuItem(
-            title: "Cycle Across All Apps",
-            action: #selector(toggleCycleScope),
-            keyEquivalent: ""
-        )
-        scopeMenuItem.state = cycleAllApplications ? .on : .off
-        scopeMenuItem.target = self
-        menu.addItem(scopeMenuItem)
+        // ── Cmd+Vol Mode submenu (radio group) ──
+        let modeItem = NSMenuItem(title: "Cmd+Vol Mode", action: nil, keyEquivalent: "")
+        let modeMenu = NSMenu(title: "Cmd+Vol Mode")
+
+        cycleModeAppsMenuItem = NSMenuItem(
+            title: "Cycle Across Apps",
+            action: #selector(setCycleMode(_:)), keyEquivalent: "")
+        cycleModeAppsMenuItem.tag    = 0
+        cycleModeAppsMenuItem.state  = (cycleAllApplications && !cycleFlatAllWindows) ? .on : .off
+        cycleModeAppsMenuItem.target = self
+        modeMenu.addItem(cycleModeAppsMenuItem)
+
+        cycleModeFlatMenuItem = NSMenuItem(
+            title: "Cycle All App Windows",
+            action: #selector(setCycleMode(_:)), keyEquivalent: "")
+        cycleModeFlatMenuItem.tag    = 1
+        cycleModeFlatMenuItem.state  = cycleFlatAllWindows ? .on : .off
+        cycleModeFlatMenuItem.target = self
+        modeMenu.addItem(cycleModeFlatMenuItem)
+
+        cycleModeCurrentMenuItem = NSMenuItem(
+            title: "Cycle Current App Windows",
+            action: #selector(setCycleMode(_:)), keyEquivalent: "")
+        cycleModeCurrentMenuItem.tag    = 2
+        cycleModeCurrentMenuItem.state  = (!cycleAllApplications && !cycleFlatAllWindows) ? .on : .off
+        cycleModeCurrentMenuItem.target = self
+        modeMenu.addItem(cycleModeCurrentMenuItem)
+
+        modeItem.submenu = modeMenu
+        menu.addItem(modeItem)
 
         currentMonitorMenuItem = NSMenuItem(
             title: "Current Monitor Only",
@@ -948,10 +1067,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc func toggleCycleScope(_ sender: NSMenuItem) {
-        cycleAllApplications.toggle()
-        sender.state = cycleAllApplications ? .on : .off
+    @objc func setCycleMode(_ sender: NSMenuItem) {
+        cycleModeAppsMenuItem.state    = .off
+        cycleModeFlatMenuItem.state    = .off
+        cycleModeCurrentMenuItem.state = .off
+        sender.state = .on
+        switch sender.tag {
+        case 0:   // Cycle Across Apps
+            cycleAllApplications = true
+            cycleFlatAllWindows  = false
+        case 1:   // Cycle All App Windows (flat)
+            cycleAllApplications = false
+            cycleFlatAllWindows  = true
+        default:  // Cycle Current App Windows
+            cycleAllApplications = false
+            cycleFlatAllWindows  = false
+        }
         UserDefaults.standard.set(cycleAllApplications, forKey: kPrefCycleAllApplications)
+        UserDefaults.standard.set(cycleFlatAllWindows,  forKey: kPrefCycleFlatAllWindows)
     }
 
     @objc func toggleCurrentMonitor(_ sender: NSMenuItem) {
