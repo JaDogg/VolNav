@@ -133,6 +133,9 @@ let kPrefCycleFlatAllWindows = "CycleFlatAllWindows"
 var shiftVolScrollMode = false
 let kPrefShiftVolScrollMode = "ShiftVolScrollMode"
 
+var shiftVolScrollReversed = false
+let kPrefShiftVolScrollReversed = "ShiftVolScrollReversed"
+
 /// Returns the screen that contains the current mouse pointer.
 func mouseScreen() -> NSScreen {
     let pt = NSEvent.mouseLocation
@@ -653,6 +656,26 @@ func postKeyStroke(_ keystroke: TabKeyStroke) {
     up.post(tap: .cgAnnotatedSessionEventTap)
 }
 
+/// Synthesises a left-mouse-button click at the current cursor position.
+func postMouseClick() {
+    // NSEvent.mouseLocation uses AppKit coords (Y from bottom); CG needs Y from top.
+    let loc = NSEvent.mouseLocation
+    let primaryH = NSScreen.screens.first?.frame.height ?? 0
+    let cgLoc = CGPoint(x: loc.x, y: primaryH - loc.y)
+
+    guard let source = CGEventSource(stateID: .hidSystemState),
+          let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown,
+                             mouseCursorPosition: cgLoc, mouseButton: .left),
+          let up   = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp,
+                             mouseCursorPosition: cgLoc, mouseButton: .left)
+    else { return }
+
+    down.setIntegerValueField(.eventSourceUserData, value: kSyntheticEventMarker)
+    up.setIntegerValueField(.eventSourceUserData,   value: kSyntheticEventMarker)
+    down.post(tap: .cgAnnotatedSessionEventTap)
+    up.post(tap: .cgAnnotatedSessionEventTap)
+}
+
 // MARK: - Event Tap Callback
 
 func eventTapCallback(
@@ -718,8 +741,13 @@ func eventTapCallback(
     }
 
     if keyCode == NX_KEYTYPE_MUTE {
-        // Shift+Mute → actual mute (pass through to system).
         if globalFlags.contains(.maskShift) {
+            if shiftVolScrollMode {
+                // Shift+Mute in scroll mode → left mouse click at cursor position.
+                postMouseClick()
+                return nil
+            }
+            // Shift+Mute normally → actual mute (pass through to system).
             return Unmanaged.passRetained(event)
         }
         guard !frontBundleID.isEmpty, supportedApps.contains(frontBundleID) else { return nil }
@@ -739,9 +767,10 @@ func eventTapCallback(
     // If Shift is held: scroll mode → Page Up/Down; otherwise real volume.
     if globalFlags.contains(.maskShift) {
         if shiftVolScrollMode {
-            // Page Up = 116, Page Down = 121
-            let keyCode: CGKeyCode = forward ? 116 : 121
-            postKeyStroke(TabKeyStroke(keyCode: keyCode, flags: []))
+            // Page Up = 116, Page Down = 121; optionally reversed.
+            let scrollUp = shiftVolScrollReversed ? !forward : forward
+            let pageKeyCode: CGKeyCode = scrollUp ? 116 : 121
+            postKeyStroke(TabKeyStroke(keyCode: pageKeyCode, flags: []))
             return nil
         }
         return Unmanaged.passRetained(event)
@@ -784,6 +813,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var currentMonitorMenuItem: NSMenuItem!
     var shiftVolRealMenuItem: NSMenuItem!
     var shiftVolScrollMenuItem: NSMenuItem!
+    var shiftVolScrollReverseMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         requestAccessibility()
@@ -800,6 +830,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if UserDefaults.standard.object(forKey: kPrefShiftVolScrollMode) != nil {
             shiftVolScrollMode = UserDefaults.standard.bool(forKey: kPrefShiftVolScrollMode)
+        }
+        if UserDefaults.standard.object(forKey: kPrefShiftVolScrollReversed) != nil {
+            shiftVolScrollReversed = UserDefaults.standard.bool(forKey: kPrefShiftVolScrollReversed)
         }
         if let saved = UserDefaults.standard.array(forKey: kPrefIgnoredApps) as? [String] {
             ignoredBundleIDs = Set(saved)
@@ -846,7 +879,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(makeBindingRow("Mute", "New Tab"))
         menu.addItem(makeBindingRow("Opt+Mute", "Close Tab"))
         menu.addItem(makeBindingRow("Shift+Vol", "Real Volume / Page Up·Down"))
-        menu.addItem(makeBindingRow("Shift+Mute", "Mute"))
+        menu.addItem(makeBindingRow("Shift+Mute", "Mute / Click (scroll mode)"))
         menu.addItem(makeBindingRow("Cmd+Vol", "Cycle Windows/Apps"))
 
         menu.addItem(.separator())
@@ -931,6 +964,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         shiftVolScrollMenuItem.state  = shiftVolScrollMode ? .on : .off
         shiftVolScrollMenuItem.target = self
         shiftVolModeMenu.addItem(shiftVolScrollMenuItem)
+
+        shiftVolModeMenu.addItem(.separator())
+
+        shiftVolScrollReverseMenuItem = NSMenuItem(
+            title: "Reverse Scroll Direction",
+            action: #selector(toggleScrollReverse(_:)), keyEquivalent: "")
+        shiftVolScrollReverseMenuItem.state  = shiftVolScrollReversed ? .on : .off
+        shiftVolScrollReverseMenuItem.target = self
+        shiftVolModeMenu.addItem(shiftVolScrollReverseMenuItem)
 
         shiftVolModeItem.submenu = shiftVolModeMenu
         menu.addItem(shiftVolModeItem)
@@ -1114,6 +1156,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func updateScrollModeMenuItem() {
         shiftVolRealMenuItem?.state   = shiftVolScrollMode ? .off : .on
         shiftVolScrollMenuItem?.state = shiftVolScrollMode ? .on  : .off
+    }
+
+    @objc func toggleScrollReverse(_ sender: NSMenuItem) {
+        shiftVolScrollReversed.toggle()
+        sender.state = shiftVolScrollReversed ? .on : .off
+        UserDefaults.standard.set(shiftVolScrollReversed, forKey: kPrefShiftVolScrollReversed)
     }
 
     @objc func toggleIgnoreApp(_ sender: NSMenuItem) {
