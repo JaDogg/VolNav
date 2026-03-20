@@ -718,14 +718,9 @@ func eventTapCallback(
     }
 
     if keyCode == NX_KEYTYPE_MUTE {
-        // Shift+Mute → toggle scroll mode (Shift+Vol emits Page Up/Down).
+        // Shift+Mute → actual mute (pass through to system).
         if globalFlags.contains(.maskShift) {
-            shiftVolScrollMode.toggle()
-            UserDefaults.standard.set(shiftVolScrollMode, forKey: kPrefShiftVolScrollMode)
-            DispatchQueue.main.async {
-                (NSApp.delegate as? AppDelegate)?.updateScrollModeMenuItem()
-            }
-            return nil
+            return Unmanaged.passRetained(event)
         }
         guard !frontBundleID.isEmpty, supportedApps.contains(frontBundleID) else { return nil }
 
@@ -787,7 +782,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var removeTabMenuItem: NSMenuItem!
     var windowNavExcludeMenuItem: NSMenuItem!
     var currentMonitorMenuItem: NSMenuItem!
-    var scrollModeMenuItem: NSMenuItem!
+    var shiftVolRealMenuItem: NSMenuItem!
+    var shiftVolScrollMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         requestAccessibility()
@@ -850,7 +846,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(makeBindingRow("Mute", "New Tab"))
         menu.addItem(makeBindingRow("Opt+Mute", "Close Tab"))
         menu.addItem(makeBindingRow("Shift+Vol", "Real Volume / Page Up·Down"))
-        menu.addItem(makeBindingRow("Shift+Mute", "Toggle Scroll Mode"))
+        menu.addItem(makeBindingRow("Shift+Mute", "Mute"))
         menu.addItem(makeBindingRow("Cmd+Vol", "Cycle Windows/Apps"))
 
         menu.addItem(.separator())
@@ -916,14 +912,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         currentMonitorMenuItem.target = self
         menu.addItem(currentMonitorMenuItem)
 
-        scrollModeMenuItem = NSMenuItem(
-            title: "Shift+Vol → Page Up/Down",
-            action: #selector(toggleScrollMode),
-            keyEquivalent: ""
-        )
-        scrollModeMenuItem.state = shiftVolScrollMode ? .on : .off
-        scrollModeMenuItem.target = self
-        menu.addItem(scrollModeMenuItem)
+        // ── Shift+Vol Mode submenu (radio group) ──
+        let shiftVolModeItem = NSMenuItem(title: "Shift+Vol Mode", action: nil, keyEquivalent: "")
+        let shiftVolModeMenu = NSMenu(title: "Shift+Vol Mode")
+
+        shiftVolRealMenuItem = NSMenuItem(
+            title: "Real Volume",
+            action: #selector(setShiftVolMode(_:)), keyEquivalent: "")
+        shiftVolRealMenuItem.tag    = 0
+        shiftVolRealMenuItem.state  = shiftVolScrollMode ? .off : .on
+        shiftVolRealMenuItem.target = self
+        shiftVolModeMenu.addItem(shiftVolRealMenuItem)
+
+        shiftVolScrollMenuItem = NSMenuItem(
+            title: "Page Up / Page Down",
+            action: #selector(setShiftVolMode(_:)), keyEquivalent: "")
+        shiftVolScrollMenuItem.tag    = 1
+        shiftVolScrollMenuItem.state  = shiftVolScrollMode ? .on : .off
+        shiftVolScrollMenuItem.target = self
+        shiftVolModeMenu.addItem(shiftVolScrollMenuItem)
+
+        shiftVolModeItem.submenu = shiftVolModeMenu
+        menu.addItem(shiftVolModeItem)
 
         menu.addItem(.separator())
 
@@ -1093,14 +1103,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(cycleCurrentMonitorOnly, forKey: kPrefCycleCurrentMonitorOnly)
     }
 
-    @objc func toggleScrollMode(_ sender: NSMenuItem) {
-        shiftVolScrollMode.toggle()
-        sender.state = shiftVolScrollMode ? .on : .off
+    @objc func setShiftVolMode(_ sender: NSMenuItem) {
+        shiftVolRealMenuItem.state   = .off
+        shiftVolScrollMenuItem.state = .off
+        sender.state = .on
+        shiftVolScrollMode = sender.tag == 1
         UserDefaults.standard.set(shiftVolScrollMode, forKey: kPrefShiftVolScrollMode)
     }
 
     func updateScrollModeMenuItem() {
-        scrollModeMenuItem?.state = shiftVolScrollMode ? .on : .off
+        shiftVolRealMenuItem?.state   = shiftVolScrollMode ? .off : .on
+        shiftVolScrollMenuItem?.state = shiftVolScrollMode ? .on  : .off
     }
 
     @objc func toggleIgnoreApp(_ sender: NSMenuItem) {
