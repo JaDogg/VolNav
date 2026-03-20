@@ -2,6 +2,8 @@
 
 VolNav is a macOS menu-bar utility that repurposes the hardware volume and mute keys as keyboard navigation shortcuts — tab switching, window cycling, and app switching — without touching the mouse.
 
+If your keyboard has a volume wheel or a dedicated mute button, VolNav makes those controls significantly more useful — the wheel becomes a tab/window navigator and the mute button opens or closes tabs.
+
 It runs as a background accessibility process (no Dock icon) and requires Accessibility permission to intercept media keys.
 
 ## What it does
