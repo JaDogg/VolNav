@@ -8,7 +8,7 @@ VolNav is a single-file macOS menu-bar utility that intercepts hardware volume/m
 
 ```
 VolNav/
-├── main.swift          # Entire application — one file, ~1270 lines
+├── main.swift          # Entire application — one file, ~1320 lines
 ├── build.sh            # Builds VolumeNavigator.app bundle (see Build section)
 ├── AppIcon.icns        # Pre-built app icon (copied by build.sh)
 ├── icon.svg            # Source icon (used by build.sh if ImageMagick present)
@@ -26,11 +26,11 @@ Everything lives in `main.swift`. There is no Xcode project, no SPM manifest, an
 | Cycle HUD | 163–322 | `CycleHUD` class — floating NSPanel for visual feedback |
 | App Switching (MRU) | 323–380 | `seedMRU`, `appHasWindowOnScreen`, `nextAppPID` |
 | Window Cycling | 380–590 | `cycleWindows`, `cycleWindowsFlat`, helpers |
-| Tab Cycling | 590–655 | `tabKeystrokeForApp`, `newTabKeystrokeForApp`, `postKeyStroke` |
-| Event Tap Callback | 655–775 | `eventTapCallback` — core key interception logic |
-| AppDelegate | 775–1220 | Menu bar setup, preference loading, action handlers |
-| NSMenuDelegate | 1220–1270 | `menuWillOpen` — dynamic menu item titles/states |
-| Entry Point | 1270 | `NSApplication.shared.run()` |
+| Tab Cycling | 590–680 | `tabKeystrokeForApp`, `newTabKeystrokeForApp`, `postKeyStroke`, `postMouseClick` |
+| Event Tap Callback | 680–800 | `eventTapCallback` — core key interception logic |
+| AppDelegate | 800–1265 | Menu bar setup, preference loading, action handlers |
+| NSMenuDelegate | 1265–1315 | `menuWillOpen` — dynamic menu item titles/states |
+| Entry Point | 1318 | `NSApplication.shared.run()` |
 
 ## Key Types & Variables
 
@@ -42,6 +42,7 @@ Everything lives in `main.swift`. There is no Xcode project, no SPM manifest, an
 | `cycleFlatAllWindows` | `CycleFlatAllWindows` | `false` | Cmd+Vol cycles all windows across all apps |
 | `cycleCurrentMonitorOnly` | `CycleCurrentMonitorOnly` | `false` | Filter by mouse screen |
 | `shiftVolScrollMode` | `ShiftVolScrollMode` | `false` | Shift+Vol sends Page Up/Down instead of real volume |
+| `shiftVolScrollReversed` | `ShiftVolScrollReversed` | `false` | Reverses Page Up/Down direction in scroll mode |
 | `shortcutsEnabled` | — | `true` | Global on/off toggle |
 
 Three-way Cmd+Vol mode encoding:
@@ -66,6 +67,7 @@ Three-way Cmd+Vol mode encoding:
 
 - **`eventTapCallback`** — CGEvent tap handler; reads NX key codes and modifier flags, dispatches to tab/window/mute logic
 - **`postKeyStroke(_:)`** — synthesises a CGEvent keystroke marked with `kSyntheticEventMarker` so the tap ignores it
+- **`postMouseClick()`** — synthesises a left-mouse-button click at the current cursor position (used by Shift+Mute in scroll mode)
 
 ### Tab switching
 
@@ -91,6 +93,7 @@ Three-way Cmd+Vol mode encoding:
 |---|---|---|
 | `setCycleMode(_:)` | "Cmd+Vol Mode" submenu | Sets `cycleAllApplications` / `cycleFlatAllWindows` |
 | `setShiftVolMode(_:)` | "Shift+Vol Mode" submenu | Sets `shiftVolScrollMode` |
+| `toggleScrollReverse(_:)` | "Reverse Scroll Direction" | Toggles `shiftVolScrollReversed` |
 | `toggleCurrentMonitor(_:)` | "Current Monitor Only" | Toggles `cycleCurrentMonitorOnly` |
 | `toggleShortcuts(_:)` | "Enable Shortcuts" | Toggles `shortcutsEnabled` |
 | `toggleIgnoreApp(_:)` | "Ignore App" | Adds/removes frontmost app from `ignoredBundleIDs` |
