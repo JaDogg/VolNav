@@ -130,8 +130,9 @@ let kPrefCycleCurrentMonitorOnly = "CycleCurrentMonitorOnly"
 var cycleFlatAllWindows = false
 let kPrefCycleFlatAllWindows = "CycleFlatAllWindows"
 
-var shiftVolScrollMode = false
-let kPrefShiftVolScrollMode = "ShiftVolScrollMode"
+/// 0 = real volume, 1 = Page Up/Down, 2 = Up/Down Arrow
+var shiftVolMode: Int = 0
+let kPrefShiftVolMode = "ShiftVolMode"
 
 var shiftVolScrollReversed = false
 let kPrefShiftVolScrollReversed = "ShiftVolScrollReversed"
@@ -741,8 +742,8 @@ func eventTapCallback(
 
     if keyCode == NX_KEYTYPE_MUTE {
         if globalFlags.contains(.maskShift) {
-            if shiftVolScrollMode {
-                // Shift+Mute in scroll mode → left mouse click at cursor position.
+            if shiftVolMode != 0 {
+                // Shift+Mute in non-real mode → left mouse click at cursor position.
                 postMouseClick()
                 return nil
             }
@@ -763,13 +764,18 @@ func eventTapCallback(
 
     let forward = keyCode == NX_KEYTYPE_SOUND_UP
 
-    // If Shift is held: scroll mode → Page Up/Down; otherwise real volume.
+    // If Shift is held: dispatch based on mode; otherwise real volume.
     if globalFlags.contains(.maskShift) {
-        if shiftVolScrollMode {
+        if shiftVolMode == 1 {
             // Page Up = 116, Page Down = 121; optionally reversed.
-            let scrollUp = shiftVolScrollReversed ? !forward : forward
-            let pageKeyCode: CGKeyCode = scrollUp ? 116 : 121
-            postKeyStroke(TabKeyStroke(keyCode: pageKeyCode, flags: []))
+            let up = shiftVolScrollReversed ? !forward : forward
+            postKeyStroke(TabKeyStroke(keyCode: up ? 116 : 121, flags: []))
+            return nil
+        }
+        if shiftVolMode == 2 {
+            // Up Arrow = 126, Down Arrow = 125; optionally reversed.
+            let up = shiftVolScrollReversed ? !forward : forward
+            postKeyStroke(TabKeyStroke(keyCode: up ? 126 : 125, flags: []))
             return nil
         }
         return Unmanaged.passRetained(event)
@@ -812,6 +818,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var currentMonitorMenuItem: NSMenuItem!
     var shiftVolRealMenuItem: NSMenuItem!
     var shiftVolScrollMenuItem: NSMenuItem!
+    var shiftVolArrowMenuItem: NSMenuItem!
     var shiftVolScrollReverseMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -827,8 +834,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             cycleFlatAllWindows = UserDefaults.standard.bool(forKey: kPrefCycleFlatAllWindows)
             if cycleFlatAllWindows { cycleAllApplications = false }
         }
-        if UserDefaults.standard.object(forKey: kPrefShiftVolScrollMode) != nil {
-            shiftVolScrollMode = UserDefaults.standard.bool(forKey: kPrefShiftVolScrollMode)
+        // Migrate old boolean pref to new int pref.
+        if UserDefaults.standard.object(forKey: "ShiftVolScrollMode") != nil
+            && UserDefaults.standard.object(forKey: kPrefShiftVolMode) == nil {
+            shiftVolMode = UserDefaults.standard.bool(forKey: "ShiftVolScrollMode") ? 1 : 0
+        }
+        if UserDefaults.standard.object(forKey: kPrefShiftVolMode) != nil {
+            shiftVolMode = UserDefaults.standard.integer(forKey: kPrefShiftVolMode)
         }
         if UserDefaults.standard.object(forKey: kPrefShiftVolScrollReversed) != nil {
             shiftVolScrollReversed = UserDefaults.standard.bool(forKey: kPrefShiftVolScrollReversed)
@@ -877,7 +889,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(makeBindingRow("Vol ↑↓", "Next / Prev Tab"))
         menu.addItem(makeBindingRow("Mute", "New Tab"))
         menu.addItem(makeBindingRow("Opt+Mute", "Close Tab"))
-        menu.addItem(makeBindingRow("Shift+Vol", "Real Volume / Page Up·Down"))
+        menu.addItem(makeBindingRow("Shift+Vol", "Real Volume / Page Up·Down / Arrow Keys"))
         menu.addItem(makeBindingRow("Shift+Mute", "Mute / Click (scroll mode)"))
         menu.addItem(makeBindingRow("Cmd+Vol", "Cycle Windows/Apps"))
 
@@ -952,7 +964,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             title: "Real Volume",
             action: #selector(setShiftVolMode(_:)), keyEquivalent: "")
         shiftVolRealMenuItem.tag    = 0
-        shiftVolRealMenuItem.state  = shiftVolScrollMode ? .off : .on
+        shiftVolRealMenuItem.state  = shiftVolMode == 0 ? .on : .off
         shiftVolRealMenuItem.target = self
         shiftVolModeMenu.addItem(shiftVolRealMenuItem)
 
@@ -960,9 +972,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             title: "Page Up / Page Down",
             action: #selector(setShiftVolMode(_:)), keyEquivalent: "")
         shiftVolScrollMenuItem.tag    = 1
-        shiftVolScrollMenuItem.state  = shiftVolScrollMode ? .on : .off
+        shiftVolScrollMenuItem.state  = shiftVolMode == 1 ? .on : .off
         shiftVolScrollMenuItem.target = self
         shiftVolModeMenu.addItem(shiftVolScrollMenuItem)
+
+        shiftVolArrowMenuItem = NSMenuItem(
+            title: "Up / Down Arrow",
+            action: #selector(setShiftVolMode(_:)), keyEquivalent: "")
+        shiftVolArrowMenuItem.tag    = 2
+        shiftVolArrowMenuItem.state  = shiftVolMode == 2 ? .on : .off
+        shiftVolArrowMenuItem.target = self
+        shiftVolModeMenu.addItem(shiftVolArrowMenuItem)
 
         shiftVolModeMenu.addItem(.separator())
 
@@ -1147,14 +1167,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func setShiftVolMode(_ sender: NSMenuItem) {
         shiftVolRealMenuItem.state   = .off
         shiftVolScrollMenuItem.state = .off
+        shiftVolArrowMenuItem.state  = .off
         sender.state = .on
-        shiftVolScrollMode = sender.tag == 1
-        UserDefaults.standard.set(shiftVolScrollMode, forKey: kPrefShiftVolScrollMode)
+        shiftVolMode = sender.tag
+        UserDefaults.standard.set(shiftVolMode, forKey: kPrefShiftVolMode)
     }
 
     func updateScrollModeMenuItem() {
-        shiftVolRealMenuItem?.state   = shiftVolScrollMode ? .off : .on
-        shiftVolScrollMenuItem?.state = shiftVolScrollMode ? .on  : .off
+        shiftVolRealMenuItem?.state   = shiftVolMode == 0 ? .on : .off
+        shiftVolScrollMenuItem?.state = shiftVolMode == 1 ? .on : .off
+        shiftVolArrowMenuItem?.state  = shiftVolMode == 2 ? .on : .off
     }
 
     @objc func toggleScrollReverse(_ sender: NSMenuItem) {
