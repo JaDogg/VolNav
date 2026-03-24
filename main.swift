@@ -658,10 +658,8 @@ func postKeyStroke(_ keystroke: TabKeyStroke) {
 
 /// Synthesises a left-mouse-button click at the current cursor position.
 func postMouseClick() {
-    // NSEvent.mouseLocation uses AppKit coords (Y from bottom); CG needs Y from top.
-    let loc = NSEvent.mouseLocation
-    let primaryH = NSScreen.screens.first?.frame.height ?? 0
-    let cgLoc = CGPoint(x: loc.x, y: primaryH - loc.y)
+    // Read current mouse position in CG coordinates directly (avoids AppKit coord conversion).
+    let cgLoc = CGEvent(source: nil)?.location ?? .zero
 
     guard let source = CGEventSource(stateID: .hidSystemState),
           let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown,
@@ -672,8 +670,9 @@ func postMouseClick() {
 
     down.setIntegerValueField(.eventSourceUserData, value: kSyntheticEventMarker)
     up.setIntegerValueField(.eventSourceUserData,   value: kSyntheticEventMarker)
-    down.post(tap: .cgAnnotatedSessionEventTap)
-    up.post(tap: .cgAnnotatedSessionEventTap)
+    // Post at HID level so the window server can route the click to the window under the cursor.
+    down.post(tap: .cghidEventTap)
+    up.post(tap: .cghidEventTap)
 }
 
 // MARK: - Event Tap Callback
