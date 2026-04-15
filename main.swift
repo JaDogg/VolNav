@@ -778,6 +778,12 @@ func eventTapCallback(
             postKeyStroke(TabKeyStroke(keyCode: up ? 126 : 125, flags: []))
             return nil
         }
+        if shiftVolMode == 3 {
+            // iTerm2 pane navigation: Cmd+] = next pane (30), Cmd+[ = prev pane (33); optionally reversed.
+            let next = shiftVolScrollReversed ? !forward : forward
+            postKeyStroke(TabKeyStroke(keyCode: next ? 30 : 33, flags: .maskCommand))
+            return nil
+        }
         return Unmanaged.passRetained(event)
     }
 
@@ -819,6 +825,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var shiftVolRealMenuItem: NSMenuItem!
     var shiftVolScrollMenuItem: NSMenuItem!
     var shiftVolArrowMenuItem: NSMenuItem!
+    var shiftVolITermMenuItem: NSMenuItem!
     var shiftVolScrollReverseMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -983,6 +990,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         shiftVolArrowMenuItem.state  = shiftVolMode == 2 ? .on : .off
         shiftVolArrowMenuItem.target = self
         shiftVolModeMenu.addItem(shiftVolArrowMenuItem)
+
+        shiftVolITermMenuItem = NSMenuItem(
+            title: "iTerm2 Pane Navigation",
+            action: #selector(setShiftVolMode(_:)), keyEquivalent: "")
+        shiftVolITermMenuItem.tag    = 3
+        shiftVolITermMenuItem.state  = shiftVolMode == 3 ? .on : .off
+        shiftVolITermMenuItem.target = self
+        shiftVolModeMenu.addItem(shiftVolITermMenuItem)
 
         shiftVolModeMenu.addItem(.separator())
 
@@ -1168,6 +1183,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         shiftVolRealMenuItem.state   = .off
         shiftVolScrollMenuItem.state = .off
         shiftVolArrowMenuItem.state  = .off
+        shiftVolITermMenuItem.state  = .off
         sender.state = .on
         shiftVolMode = sender.tag
         UserDefaults.standard.set(shiftVolMode, forKey: kPrefShiftVolMode)
@@ -1177,6 +1193,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         shiftVolRealMenuItem?.state   = shiftVolMode == 0 ? .on : .off
         shiftVolScrollMenuItem?.state = shiftVolMode == 1 ? .on : .off
         shiftVolArrowMenuItem?.state  = shiftVolMode == 2 ? .on : .off
+        shiftVolITermMenuItem?.state  = shiftVolMode == 3 ? .on : .off
     }
 
     @objc func toggleScrollReverse(_ sender: NSMenuItem) {
